@@ -7,14 +7,16 @@ import {
   BotName,
   BotRuntimeStatus,
   BrowserLaneState,
-  CandidateToken,
   ChartRange,
   DeskSettings,
+  LivePnlTick,
   Position,
 } from '../types/desk';
 import { BOT_META } from '../engine/defaults';
+import { LiveFeedSource, LiveFeedStatus } from '../engine/marketFeed';
 import { BalanceChart } from './BalanceChart';
 import { LiveBrowserLane } from './LiveBrowserLane';
+import { ProfitTrendChart } from './ProfitTrendChart';
 import { WindowsControlsPanel } from './WindowsControlsPanel';
 
 interface DeskViewProps {
@@ -22,6 +24,8 @@ interface DeskViewProps {
   freeCash: number;
   startCash: number;
   balanceHistory: BalancePoint[];
+  livePnlTicks: LivePnlTick[];
+  lastPriceSyncTs: number | null;
   chartRange: ChartRange;
   onChartRangeChange: (r: ChartRange) => void;
   lane: BrowserLaneState;
@@ -29,21 +33,25 @@ interface DeskViewProps {
   bots: Record<BotName, BotRuntimeStatus>;
   latestAudit: AnalystDecision | null;
   openPositions: Position[];
+  allPositions: Position[];
   tradesTonight: number;
   passedTestsCount: number;
   activities: ActivityItem[];
   settings: DeskSettings;
   engineRunning: boolean;
+  scanningLive: boolean;
+  liveFeedStatus: LiveFeedStatus | null;
+  lastSyncError: string | null;
   onToggleEngine: () => void;
-  onInjectTestCoin: () => void;
-  onRunCustomToken: (token: CandidateToken) => void;
+  onScanRealSource: (source: LiveFeedSource) => Promise<{ count: number; error?: string }>;
+  onLookupRealToken: (query: string) => Promise<{ ok: boolean; message: string }>;
   onUpdateSetting: <K extends keyof DeskSettings>(
     key: K,
     value: DeskSettings[K],
     who?: 'me' | 'telegram'
   ) => void;
   onPauseAllSafe: () => void;
-  onNavigate: (tab: 'home' | 'bots' | 'activity' | 'settings' | 'windows') => void;
+  onNavigate: (tab: 'home' | 'bots' | 'activity' | 'settings' | 'windows' | 'manual') => void;
   onSelectPosition: (pos: Position) => void;
   onSelectAudit: (audit: AnalystDecision) => void;
 }
@@ -53,6 +61,8 @@ export const DeskView: React.FC<DeskViewProps> = ({
   freeCash,
   startCash,
   balanceHistory,
+  livePnlTicks,
+  lastPriceSyncTs,
   chartRange,
   onChartRangeChange,
   lane,
@@ -60,14 +70,18 @@ export const DeskView: React.FC<DeskViewProps> = ({
   bots,
   latestAudit,
   openPositions,
+  allPositions,
   tradesTonight,
   passedTestsCount,
   activities,
   settings,
   engineRunning,
+  scanningLive,
+  liveFeedStatus,
+  lastSyncError,
   onToggleEngine,
-  onInjectTestCoin,
-  onRunCustomToken,
+  onScanRealSource,
+  onLookupRealToken,
   onUpdateSetting,
   onPauseAllSafe,
   onNavigate,
@@ -134,10 +148,11 @@ export const DeskView: React.FC<DeskViewProps> = ({
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={onInjectTestCoin}
-                className="px-3.5 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                disabled={scanningLive}
+                onClick={() => void onScanRealSource('auto')}
+                className="px-3.5 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
               >
-                新規卒業トークン投入
+                {scanningLive ? '実データ取得中...' : '最新Solana実銘柄スキャン'}
               </button>
               <button
                 type="button"
@@ -162,6 +177,12 @@ export const DeskView: React.FC<DeskViewProps> = ({
               </button>
             </div>
           </div>
+
+          {lastSyncError && (
+            <div className="mb-3 px-3 py-2 rounded-lg bg-[#231516] border border-[#ff453a]/40 text-xs text-[#ff453a]">
+              実データ取得エラー: {lastSyncError}
+            </div>
+          )}
 
           <BalanceChart
             points={balanceHistory}
@@ -192,11 +213,11 @@ export const DeskView: React.FC<DeskViewProps> = ({
             onTogglePrivate={onTogglePrivate}
           />
 
-          <div className="flex items-center justify-between text-xs text-[#ebebf5]/55 pt-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#ebebf5]/55 pt-1">
             <span>
               {settings.always_on_24h
-                ? `24時間自由稼働（時間制限なし · 定時レポート ${settings.report_time}）`
-                : `時間帯稼働: ${settings.night_start} – ${settings.lock_time} (レポート ${settings.report_time})`}
+                ? `24時間自由稼働 · 実データ接続 (${liveFeedStatus?.pumpPortalConnected ? 'PumpPortal WS + ' : ''}DexScreener / RugCheck / RPC)`
+                : `時間帯稼働: ${settings.night_start} – ${settings.lock_time}`}
             </span>
             <button
               type="button"
@@ -209,6 +230,15 @@ export const DeskView: React.FC<DeskViewProps> = ({
           </div>
         </section>
       </div>
+
+      {/* Recent Profit Trend Line Chart (Real-Time Live Stream + Per-Trade +/-) */}
+      <ProfitTrendChart
+        positions={allPositions}
+        livePnlTicks={livePnlTicks}
+        engineRunning={engineRunning}
+        lastPriceSyncTs={lastPriceSyncTs}
+        onSelectPosition={onSelectPosition}
+      />
 
       {/* 5 Bot Summary Cards */}
       <section>
@@ -531,10 +561,12 @@ export const DeskView: React.FC<DeskViewProps> = ({
         tradesTonight={tradesTonight}
         openPositionCount={openPositions.length}
         passedTestsCount={passedTestsCount}
+        scanningLive={scanningLive}
         onToggleEngine={onToggleEngine}
         onTogglePrivate={onTogglePrivate}
         onUpdateSetting={onUpdateSetting}
-        onRunCustomToken={onRunCustomToken}
+        onLookupRealToken={onLookupRealToken}
+        onScanRealSource={onScanRealSource}
         onPauseAllSafe={onPauseAllSafe}
       />
     </div>

@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  BookOpen,
   Bot,
   Download,
   Home,
@@ -21,6 +22,7 @@ import {
   ChartRange,
   ConsoleMessage,
   DeskSettings,
+  LivePnlTick,
   Position,
 } from './types/desk';
 import { BOT_META, DEFAULT_SETTINGS } from './engine/defaults';
@@ -32,7 +34,14 @@ import {
 } from './engine/bots';
 import { calculateFomoFee } from './engine/fees';
 import { coinUrl } from './engine/links';
-import { fetchLiveDexScreenerTokens, generateCandidateToken } from './engine/marketFeed';
+import {
+  fetchLiveFeedStatus,
+  fetchRealLivePrices,
+  fetchRealSolanaCandidates,
+  LiveFeedSource,
+  LiveFeedStatus,
+  lookupRealSolanaToken,
+} from './engine/marketFeed';
 import { runAcceptanceSuite } from './engine/acceptanceTests';
 import { downloadWindowsAppZip } from './engine/windowsBundle';
 import { DeskView } from './components/DeskView';
@@ -40,13 +49,15 @@ import { BotsView } from './components/BotsView';
 import { ActivityView } from './components/ActivityView';
 import { SettingsView } from './components/SettingsView';
 import { WindowsPackageView } from './components/WindowsPackageView';
+import { ManualView } from './components/ManualView';
 import { AuditModal } from './components/AuditModal';
 import { CoinDetailModal } from './components/CoinDetailModal';
 
-type NavTab = 'home' | 'bots' | 'activity' | 'settings' | 'windows';
+type NavTab = 'home' | 'bots' | 'activity' | 'settings' | 'windows' | 'manual';
 
 const STORAGE_SETTINGS_KEY = 'overnight_desk_settings_v1';
 const STORAGE_CHANGELOG_KEY = 'overnight_desk_changelog_v1';
+const STORAGE_LIVE_STATE_KEY = 'overnight_desk_live_state_v1';
 
 const NAV_ITEMS: Array<{ key: NavTab; label: string; icon: React.ComponentType<{ className?: string }> }> = [
   { key: 'home', label: 'ホーム', icon: Home },
@@ -54,6 +65,7 @@ const NAV_ITEMS: Array<{ key: NavTab; label: string; icon: React.ComponentType<{
   { key: 'activity', label: 'アクティビティ', icon: Activity },
   { key: 'settings', label: '設定', icon: Settings },
   { key: 'windows', label: 'Windows導入 & テスト', icon: Package },
+  { key: 'manual', label: '説明書', icon: BookOpen },
 ];
 
 function createInitialBots(): Record<BotName, BotRuntimeStatus> {
@@ -145,27 +157,78 @@ function loadChangeLog(): ChangeLogEntry[] {
   }
 }
 
+interface PersistedLiveState {
+  freeCash: number;
+  positions: Position[];
+  activities: ActivityItem[];
+  balanceHistory: BalancePoint[];
+  livePnlTicks: LivePnlTick[];
+}
+
+function loadLiveState(defaultCash: number): PersistedLiveState {
+  try {
+    const raw = localStorage.getItem(STORAGE_LIVE_STATE_KEY);
+    if (!raw) {
+      return {
+        freeCash: defaultCash,
+        positions: [],
+        activities: [],
+        balanceHistory: [{ ts: Date.now(), value: defaultCash }],
+        livePnlTicks: [],
+      };
+    }
+    const parsed = JSON.parse(raw) as Partial<PersistedLiveState>;
+    return {
+      freeCash: typeof parsed.freeCash === 'number' ? parsed.freeCash : defaultCash,
+      positions: Array.isArray(parsed.positions) ? parsed.positions : [],
+      activities: Array.isArray(parsed.activities) ? parsed.activities : [],
+      balanceHistory:
+        Array.isArray(parsed.balanceHistory) && parsed.balanceHistory.length > 0
+          ? parsed.balanceHistory
+          : [{ ts: Date.now(), value: defaultCash }],
+      livePnlTicks: Array.isArray(parsed.livePnlTicks) ? parsed.livePnlTicks : [],
+    };
+  } catch {
+    return {
+      freeCash: defaultCash,
+      positions: [],
+      activities: [],
+      balanceHistory: [{ ts: Date.now(), value: defaultCash }],
+      livePnlTicks: [],
+    };
+  }
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('home');
   const [searchQuery, setSearchQuery] = useState('');
   const [settings, setSettings] = useState<DeskSettings>(loadSettings);
   const [changeLog, setChangeLog] = useState<ChangeLogEntry[]>(loadChangeLog);
 
-  const [freeCash, setFreeCash] = useState<number>(() => loadSettings().paper_start_cash);
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [activities, setActivities] = useState<ActivityItem[]>([]);
-  const [balanceHistory, setBalanceHistory] = useState<BalancePoint[]>(() => {
-    const start = loadSettings().paper_start_cash;
-    const now = Date.now();
-    return Array.from({ length: 12 }).map((_, i) => ({
-      ts: now - (12 - i) * 60 * 1000,
-      value: start,
-    }));
-  });
+  const initialLive = useMemo(() => loadLiveState(loadSettings().paper_start_cash), []);
+  const [freeCash, setFreeCash] = useState<number>(initialLive.freeCash);
+  const [positions, setPositions] = useState<Position[]>(initialLive.positions);
+  const [activities, setActivities] = useState<ActivityItem[]>(initialLive.activities);
+  const [balanceHistory, setBalanceHistory] = useState<BalancePoint[]>(initialLive.balanceHistory);
+  const [livePnlTicks, setLivePnlTicks] = useState<LivePnlTick[]>(initialLive.livePnlTicks);
+  const [lastPriceSyncTs, setLastPriceSyncTs] = useState<number | null>(
+    initialLive.livePnlTicks.length > 0
+      ? initialLive.livePnlTicks[initialLive.livePnlTicks.length - 1].ts
+      : null
+  );
+  const lastNetPnlRef = useRef<number>(
+    initialLive.livePnlTicks.length > 0
+      ? initialLive.livePnlTicks[initialLive.livePnlTicks.length - 1].netPnlUsd
+      : 0
+  );
   const [chartRange, setChartRange] = useState<ChartRange>('LIVE');
   const [bots, setBots] = useState<Record<BotName, BotRuntimeStatus>>(createInitialBots);
   const [latestAudit, setLatestAudit] = useState<AnalystDecision | null>(null);
-  const [engineRunning, setEngineRunning] = useState<boolean>(false);
+  const [engineRunning, setEngineRunning] = useState<boolean>(true);
+  const [scanningLive, setScanningLive] = useState<boolean>(false);
+  const [liveFeedStatus, setLiveFeedStatus] = useState<LiveFeedStatus | null>(null);
+  const [lastSyncError, setLastSyncError] = useState<string | null>(null);
+  const seenMintsRef = useRef<Set<string>>(new Set(initialLive.positions.map((p) => p.mint)));
 
   const [lane, setLane] = useState<BrowserLaneState>({
     activeBot: null,
@@ -244,6 +307,74 @@ export default function App() {
       // ignore
     }
   }, [changeLog]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_LIVE_STATE_KEY,
+        JSON.stringify({
+          freeCash,
+          positions: positions.slice(0, 40),
+          activities: activities.slice(0, 80),
+          balanceHistory: balanceHistory.slice(-120),
+          livePnlTicks: livePnlTicks.slice(-120),
+        })
+      );
+    } catch {
+      // ignore
+    }
+  }, [freeCash, positions, activities, balanceHistory, livePnlTicks]);
+
+  const recordLivePnlTick = useCallback(
+    (
+      positionsSnapshot: Position[],
+      opts?: {
+        ts?: number;
+        eventLabel?: string;
+        positionId?: string;
+        topSymbol?: string;
+        topPriceUsd?: number;
+      }
+    ) => {
+      const ts = opts?.ts ?? Date.now();
+      let realized = 0;
+      let unrealized = 0;
+      let primaryOpen: Position | null = null;
+
+      for (const p of positionsSnapshot) {
+        if (p.closedAt !== null) {
+          realized += p.pnlUsd;
+        } else {
+          if (!primaryOpen) primaryOpen = p;
+          const openPnl =
+            p.remainingUsd * (p.currentPrice / p.entryPrice) - p.remainingUsd - p.feesUsd;
+          unrealized += openPnl;
+        }
+      }
+
+      const realizedPnlUsd = Math.round(realized * 1000) / 1000;
+      const unrealizedPnlUsd = Math.round(unrealized * 1000) / 1000;
+      const netPnlUsd = Math.round((realized + unrealized) * 1000) / 1000;
+      const deltaUsd = Math.round((netPnlUsd - lastNetPnlRef.current) * 1000) / 1000;
+      lastNetPnlRef.current = netPnlUsd;
+
+      const tick: LivePnlTick = {
+        ts,
+        netPnlUsd,
+        realizedPnlUsd,
+        unrealizedPnlUsd,
+        deltaUsd,
+        topSymbol: opts?.topSymbol ?? primaryOpen?.symbol ?? '',
+        topPriceUsd: opts?.topPriceUsd ?? primaryOpen?.currentPrice ?? 0,
+        eventLabel: opts?.eventLabel,
+        positionId: opts?.positionId ?? primaryOpen?.id,
+      };
+
+      setLivePnlTicks((prev) => [...prev.slice(-119), tick]);
+      setLastPriceSyncTs(ts);
+    },
+    []
+  );
 
   const appendBotDecision = useCallback(
     (
@@ -525,8 +656,11 @@ export default function App() {
       };
 
       const nextCash = Math.max(0, Math.round((freeCashRef.current - brain.sizeUsd) * 100) / 100);
+      const nextPositions = [newPosition, ...positionsRef.current];
+      positionsRef.current = nextPositions;
+      freeCashRef.current = nextCash;
       setFreeCash(nextCash);
-      setPositions((prev) => [newPosition, ...prev]);
+      setPositions(nextPositions);
 
       if (!skipLaneAnimation) {
         animateLaneBuy(token, brain.sizeUsd, feeUsd, curSettings.mode);
@@ -577,10 +711,10 @@ export default function App() {
         ].slice(0, 80)
       );
 
-      const currentPosVal = positionsRef.current
+      const currentPosVal = nextPositions
         .filter((p) => p.closedAt === null)
         .reduce((s, p) => s + p.remainingUsd * (p.currentPrice / p.entryPrice), 0);
-      const nextEq = Math.round((nextCash + currentPosVal + brain.sizeUsd - feeUsd) * 100) / 100;
+      const nextEq = Math.round((nextCash + currentPosVal - feeUsd) * 100) / 100;
 
       setBalanceHistory((prev) => [
         ...prev.slice(-80),
@@ -590,8 +724,15 @@ export default function App() {
           marker: { label: `Bought ${token.symbol}`, tone: 'blue' },
         },
       ]);
+
+      recordLivePnlTick(nextPositions, {
+        eventLabel: `Bought ${token.symbol}`,
+        positionId: posId,
+        topSymbol: token.symbol,
+        topPriceUsd: token.priceUsd,
+      });
     },
-    [appendBotDecision, animateLaneBuy]
+    [appendBotDecision, animateLaneBuy, recordLivePnlTick]
   );
 
   /**
@@ -613,25 +754,27 @@ export default function App() {
       const isFullClose = sellPct >= 100;
       const link = coinUrl(pos.mint, 'solana');
 
-      setFreeCash((c) => Math.round((c + netProceeds) * 100) / 100);
-
-      setPositions((prev) =>
-        prev.map((p) =>
-          p.id !== pos.id
-            ? p
-            : {
-                ...p,
-                remainingUsd: isFullClose
-                  ? 0
-                  : Math.round((p.remainingUsd * (1 - sellFraction)) * 100) / 100,
-                closedAt: isFullClose ? Date.now() : null,
-                exitPrice: isFullClose ? p.currentPrice : p.exitPrice,
-                exitReason: isFullClose ? 'manual' : p.exitReason,
-                pnlUsd: Math.round((p.pnlUsd + realizedPart) * 100) / 100,
-                feesUsd: Math.round((p.feesUsd + feeUsd) * 100) / 100,
-              }
-        )
+      const nextCash = Math.round((freeCashRef.current + netProceeds) * 100) / 100;
+      const nextPositions = positionsRef.current.map((p) =>
+        p.id !== pos.id
+          ? p
+          : {
+              ...p,
+              remainingUsd: isFullClose
+                ? 0
+                : Math.round((p.remainingUsd * (1 - sellFraction)) * 100) / 100,
+              closedAt: isFullClose ? Date.now() : null,
+              exitPrice: isFullClose ? p.currentPrice : p.exitPrice,
+              exitReason: isFullClose ? 'manual' : p.exitReason,
+              pnlUsd: Math.round((p.pnlUsd + realizedPart) * 100) / 100,
+              feesUsd: Math.round((p.feesUsd + feeUsd) * 100) / 100,
+            }
       );
+
+      freeCashRef.current = nextCash;
+      positionsRef.current = nextPositions;
+      setFreeCash(nextCash);
+      setPositions(nextPositions);
 
       appendBotDecision(
         'executor',
@@ -674,250 +817,364 @@ export default function App() {
         ].slice(0, 80)
       );
 
+      const remainingOpenVal = nextPositions
+        .filter((p) => p.closedAt === null)
+        .reduce((s, p) => s + p.remainingUsd * (p.currentPrice / p.entryPrice), 0);
+
       setBalanceHistory((prev) => [
         ...prev.slice(-80),
         {
           ts: Date.now(),
-          value: Math.round((freeCashRef.current + netProceeds) * 100) / 100,
+          value: Math.round((nextCash + remainingOpenVal) * 100) / 100,
           marker: {
             label: `${realizedPart >= 0 ? '+' : ''}$${realizedPart.toFixed(2)}`,
             tone: realizedPart >= 0 ? 'green' : 'red',
           },
         },
       ]);
+
+      recordLivePnlTick(nextPositions, {
+        eventLabel: `Sold ${realizedPart >= 0 ? '+' : '-'}$${Math.abs(realizedPart).toFixed(2)}`,
+        positionId: pos.id,
+        topSymbol: pos.symbol,
+        topPriceUsd: pos.currentPrice,
+      });
     },
-    [appendBotDecision]
+    [appendBotDecision, recordLivePnlTick]
   );
 
-  // Seed initial realistic PAPER desk state once on first mount
+  /**
+   * Scan Real Live Solana Tokens from Server (/api/live/candidates + /api/live/audit)
+   */
+  const scanRealSource = useCallback(
+    async (source: LiveFeedSource = 'auto'): Promise<{ count: number; error?: string }> => {
+      setScanningLive(true);
+      setLastSyncError(null);
+      try {
+        const res = await fetchRealSolanaCandidates(
+          source,
+          settingsRef.current.rpc_url,
+          8,
+          seenMintsRef.current
+        );
+        if (res.error) {
+          setLastSyncError(res.error);
+          return { count: 0, error: res.error };
+        }
+        let processed = 0;
+        for (const tok of res.tokens) {
+          seenMintsRef.current.add(tok.mint);
+          processTokenThroughPipeline(tok);
+          processed++;
+        }
+        const status = await fetchLiveFeedStatus();
+        if (status) setLiveFeedStatus(status);
+        return { count: processed };
+      } finally {
+        setScanningLive(false);
+      }
+    },
+    [processTokenThroughPipeline]
+  );
+
+  /**
+   * Lookup ANY Real Solana Token by exact Mint address or Ticker Symbol and run through 5-bot pipeline
+   */
+  const handleLookupRealToken = useCallback(
+    async (query: string): Promise<{ ok: boolean; message: string }> => {
+      setScanningLive(true);
+      setLastSyncError(null);
+      try {
+        const res = await lookupRealSolanaToken(query, settingsRef.current.rpc_url);
+        if (!res.token) {
+          const msg = res.error || `"${query}" に一致するSolana実銘柄が見つかりませんでした。`;
+          setLastSyncError(msg);
+          return { ok: false, message: msg };
+        }
+        seenMintsRef.current.add(res.token.mint);
+        processTokenThroughPipeline(res.token);
+        return {
+          ok: true,
+          message: `実データ取得完了: ${res.token.name} (${res.token.symbol}) · 価格 $${res.token.priceUsd.toFixed(6)} · 流動性 $${(res.token.liquidityUsd / 1000).toFixed(1)}K を5ボットパイプラインへ投入しました。`,
+        };
+      } finally {
+        setScanningLive(false);
+      }
+    },
+    [processTokenThroughPipeline]
+  );
+
+  // Initial Real Data Sync on First Mount (ZERO mock/seeded trades)
   const initializedRef = useRef(false);
   useEffect(() => {
     if (initializedRef.current) return;
     initializedRef.current = true;
+    void fetchLiveFeedStatus().then((st) => {
+      if (st) setLiveFeedStatus(st);
+    });
+    void scanRealSource('auto');
+  }, [scanRealSource]);
 
-    const t1 = generateCandidateToken('scanner_kill_liq');
-    const t2 = generateCandidateToken('analyst_fail_bundle');
-    const t3 = generateCandidateToken('clean_high');
-    const t4 = generateCandidateToken('clean_high');
-
-    processTokenThroughPipeline(t1, true);
-    processTokenThroughPipeline(t2, true);
-    processTokenThroughPipeline(t3, true);
-    processTokenThroughPipeline(t4, true);
-
-    setLane((prev) => ({
-      ...prev,
-      currentCoin: t4,
-      typedAmount: '4.32',
-      quoteText: `Quote: ~$4.22 (fee $0.10 · PAPER)`,
-      lastOrderSummary: {
-        text: `PAPER · Bought ${t4.symbol} · $4.32 verified`,
-        checks: { screen: true, api: true, chain: 'n/a' },
-        ts: Date.now(),
-      },
-      lastFrameTs: Date.now(),
-    }));
-  }, [processTokenThroughPipeline]);
-
-  // Live Automated Overnight Market Tick & Risk Guard Loop
+  // Real 24/7 Live Price Polling (3s) & Live Candidate Scanning (25s)
   useEffect(() => {
     if (!engineRunning) return;
 
-    const priceTimer = setInterval(() => {
-      const curSettings = settingsRef.current;
+    const pollRealPrices = async () => {
+      const currentPositions = positionsRef.current;
+      const openList = currentPositions.filter((p) => p.closedAt === null);
       const now = Date.now();
+      setLane((prev) => ({ ...prev, lastFrameTs: now }));
+
+      if (openList.length === 0) {
+        recordLivePnlTick(currentPositions, { ts: now });
+        return;
+      }
+
+      const mints = Array.from(new Set(openList.map((p) => p.mint)));
+      const liveMap = await fetchRealLivePrices(mints);
+      if (Object.keys(liveMap).length === 0) {
+        recordLivePnlTick(currentPositions, { ts: now });
+        return;
+      }
+
+      const curSettings = settingsRef.current;
       let cashDelta = 0;
       const newActivities: ActivityItem[] = [];
       let chartMarker: BalancePoint['marker'] | undefined;
+      let tickEventLabel: string | undefined;
+      let tickPositionId: string | undefined;
 
-      setPositions((prev) =>
-        prev.map((pos) => {
-          if (pos.closedAt !== null) return pos;
+      const nextPositions = currentPositions.map((pos) => {
+        if (pos.closedAt !== null) return pos;
+        const live = liveMap[pos.mint];
+        if (!live || live.priceUsd <= 0) return pos;
 
-          // Realistic Solana meme volatility step (-4.5% to +6.5%)
-          const stepPct = (Math.random() - 0.45) * 0.11;
-          const nextPrice = Math.max(0.000001, pos.currentPrice * (1 + stepPct));
+        const nextPrice = live.priceUsd;
+        const nextLiq = live.liquidityUsd > 0 ? live.liquidityUsd : pos.token.liquidityUsd;
 
-          // Update 1-minute candle tail
-          const updatedCandles = [...pos.token.candles];
-          const lastC = updatedCandles[updatedCandles.length - 1];
-          if (lastC) {
-            updatedCandles[updatedCandles.length - 1] = {
-              ...lastC,
-              close: nextPrice,
-              high: Math.max(lastC.high, nextPrice),
-              low: Math.min(lastC.low, nextPrice),
-            };
-          }
+        // Update real 1-minute candle bar
+        const updatedCandles = [...pos.token.candles];
+        const lastC = updatedCandles[updatedCandles.length - 1];
+        if (lastC && now - lastC.ts < 60_000) {
+          updatedCandles[updatedCandles.length - 1] = {
+            ...lastC,
+            close: nextPrice,
+            high: Math.max(lastC.high, nextPrice),
+            low: Math.min(lastC.low, nextPrice),
+            volume: Math.round(live.volumeM5Usd),
+          };
+        } else {
+          updatedCandles.push({
+            ts: now,
+            open: lastC ? lastC.close : nextPrice,
+            high: nextPrice,
+            low: nextPrice,
+            close: nextPrice,
+            volume: Math.round(live.volumeM5Usd),
+          });
+          if (updatedCandles.length > 60) updatedCandles.shift();
+        }
 
-          const guard = evaluatePositionGuard(
-            pos,
-            nextPrice,
-            pos.token.liquidityUsd,
-            pos.token.creatorBalanceNow,
-            now,
-            curSettings
-          );
+        const updatedToken = {
+          ...pos.token,
+          priceUsd: nextPrice,
+          liquidityUsd: nextLiq,
+          marketCapUsd: live.marketCapUsd > 0 ? live.marketCapUsd : pos.token.marketCapUsd,
+          volumeH1Usd: live.volumeH1Usd,
+          volumeM5Usd: live.volumeM5Usd,
+          h1ChangePct: live.h1ChangePct,
+          uniqueBuys5m: live.buys5m,
+          uniqueSells5m: live.sells5m,
+          candles: updatedCandles,
+        };
 
-          if (guard.action === 'sell_partial' && guard.reason === 'take profit') {
-            const sellFrac = guard.sellPct / 100;
-            const gross = pos.remainingUsd * (nextPrice / pos.entryPrice) * sellFrac;
-            const net = Math.max(0, gross - guard.feeUsd);
-            cashDelta += net;
-            chartMarker = {
-              label: `+$${Math.max(0, guard.estimatedPnlUsd).toFixed(2)}`,
-              tone: 'green',
-            };
-            newActivities.push({
-              id: `act-tp-${pos.id}-${now}`,
+        const guard = evaluatePositionGuard(
+          pos,
+          nextPrice,
+          nextLiq,
+          pos.token.creatorBalanceNow,
+          now,
+          curSettings
+        );
+
+        if (guard.action === 'sell_partial' && guard.reason === 'take profit') {
+          const sellFrac = guard.sellPct / 100;
+          const gross = pos.remainingUsd * (nextPrice / pos.entryPrice) * sellFrac;
+          const net = Math.max(0, gross - guard.feeUsd);
+          cashDelta += net;
+          chartMarker = {
+            label: `+$${Math.max(0, guard.estimatedPnlUsd).toFixed(2)}`,
+            tone: 'green',
+          };
+          tickEventLabel = `TP ${pos.symbol} +$${Math.max(0, guard.estimatedPnlUsd).toFixed(2)}`;
+          tickPositionId = pos.id;
+          newActivities.push({
+            id: `act-tp-${pos.id}-${now}`,
+            ts: now,
+            kind: 'sold',
+            mint: pos.mint,
+            symbol: pos.symbol,
+            name: pos.name,
+            bot: 'executor',
+            title: `Sold ${pos.symbol} (${guard.sellPct}%)`,
+            subtitle: `Executor · take profit ${curSettings.tp_x}x · trail ${curSettings.trail_pct}% active`,
+            valueText: `+$${guard.estimatedPnlUsd.toFixed(2)}`,
+            positive: true,
+            link: guard.link,
+            audit: pos.audit,
+            token: updatedToken,
+            positionId: pos.id,
+          });
+          appendBotDecision(
+            'executor',
+            {
+              id: `tp-${pos.id}-${now}`,
               ts: now,
-              kind: 'sold',
               mint: pos.mint,
               symbol: pos.symbol,
-              name: pos.name,
-              bot: 'executor',
-              title: `Sold ${pos.symbol} (${guard.sellPct}%)`,
-              subtitle: `Executor · take profit ${curSettings.tp_x}x · trail ${curSettings.trail_pct}% active`,
-              valueText: `+$${guard.estimatedPnlUsd.toFixed(2)}`,
+              verdict: `TP ${guard.sellPct}%`,
+              reason: `reached ${curSettings.tp_x}x · +$${guard.estimatedPnlUsd.toFixed(2)}`,
+              link: guard.link,
               positive: true,
-              link: guard.link,
-              audit: pos.audit,
-              token: pos.token,
-              positionId: pos.id,
-            });
-            appendBotDecision(
-              'executor',
-              {
-                id: `tp-${pos.id}-${now}`,
-                ts: now,
-                mint: pos.mint,
-                symbol: pos.symbol,
-                verdict: `TP ${guard.sellPct}%`,
-                reason: `reached ${curSettings.tp_x}x · +$${guard.estimatedPnlUsd.toFixed(2)}`,
-                link: guard.link,
-                positive: true,
-              },
-              `Take Profit ${pos.symbol}`,
-              `+$${guard.estimatedPnlUsd.toFixed(2)} · Trail active`
-            );
-            return {
-              ...pos,
-              currentPrice: nextPrice,
-              peakPrice: guard.newPeak,
-              remainingUsd: Math.round(pos.remainingUsd * (1 - sellFrac) * 100) / 100,
-              tpDone: true,
-              trailActive: true,
-              pnlUsd: Math.round((pos.pnlUsd + guard.estimatedPnlUsd) * 100) / 100,
-              feesUsd: Math.round((pos.feesUsd + guard.feeUsd) * 100) / 100,
-              token: { ...pos.token, priceUsd: nextPrice, candles: updatedCandles },
-            };
-          }
-
-          if (guard.action === 'sell_all' && guard.reason) {
-            const gross = pos.remainingUsd * (nextPrice / pos.entryPrice);
-            const net = Math.max(0, gross - guard.feeUsd);
-            cashDelta += net;
-            const isStop = guard.reason === 'stop' || guard.estimatedPnlUsd < 0;
-            chartMarker = {
-              label: isStop
-                ? `-${curSettings.stop_pct}% · -$${Math.abs(guard.estimatedPnlUsd).toFixed(2)}`
-                : `+$${guard.estimatedPnlUsd.toFixed(2)}`,
-              tone: isStop ? 'red' : 'green',
-            };
-            newActivities.push({
-              id: `act-exit-${pos.id}-${now}`,
-              ts: now,
-              kind: isStop ? 'stopped' : 'sold',
-              mint: pos.mint,
-              symbol: pos.symbol,
-              name: pos.name,
-              bot: isStop ? 'risk' : 'executor',
-              title: isStop ? `Stopped ${pos.symbol}` : `Sold ${pos.symbol}`,
-              subtitle: `${isStop ? 'Risk' : 'Executor'} · ${guard.reason} · fee $${guard.feeUsd.toFixed(2)}`,
-              valueText: `${guard.estimatedPnlUsd >= 0 ? '+' : ''}$${guard.estimatedPnlUsd.toFixed(2)}`,
-              positive: guard.estimatedPnlUsd >= 0,
-              negative: guard.estimatedPnlUsd < 0,
-              link: guard.link,
-              audit: pos.audit,
-              token: pos.token,
-              positionId: pos.id,
-            });
-            appendBotDecision(
-              'risk',
-              {
-                id: `rk-${pos.id}-${now}`,
-                ts: now,
-                mint: pos.mint,
-                symbol: pos.symbol,
-                verdict: guard.reason.toUpperCase(),
-                reason: `${guard.estimatedPnlUsd >= 0 ? '+' : ''}$${guard.estimatedPnlUsd.toFixed(2)}`,
-                link: guard.link,
-                positive: guard.estimatedPnlUsd >= 0,
-                negative: guard.estimatedPnlUsd < 0,
-              },
-              `${guard.reason}: ${pos.symbol}`,
-              `${guard.estimatedPnlUsd >= 0 ? '+' : ''}$${guard.estimatedPnlUsd.toFixed(2)}`
-            );
-            return {
-              ...pos,
-              currentPrice: nextPrice,
-              peakPrice: guard.newPeak,
-              remainingUsd: 0,
-              closedAt: now,
-              exitPrice: nextPrice,
-              exitReason: guard.reason,
-              pnlUsd: Math.round((pos.pnlUsd + guard.estimatedPnlUsd) * 100) / 100,
-              feesUsd: Math.round((pos.feesUsd + guard.feeUsd) * 100) / 100,
-              token: { ...pos.token, priceUsd: nextPrice, candles: updatedCandles },
-            };
-          }
-
+            },
+            `Take Profit ${pos.symbol}`,
+            `+$${guard.estimatedPnlUsd.toFixed(2)} · Trail active`
+          );
           return {
             ...pos,
             currentPrice: nextPrice,
             peakPrice: guard.newPeak,
-            token: { ...pos.token, priceUsd: nextPrice, candles: updatedCandles },
+            remainingUsd: Math.round(pos.remainingUsd * (1 - sellFrac) * 100) / 100,
+            tpDone: true,
+            trailActive: true,
+            pnlUsd: Math.round((pos.pnlUsd + guard.estimatedPnlUsd) * 100) / 100,
+            feesUsd: Math.round((pos.feesUsd + guard.feeUsd) * 100) / 100,
+            token: updatedToken,
           };
-        })
-      );
+        }
+
+        if (guard.action === 'sell_all' && guard.reason) {
+          const gross = pos.remainingUsd * (nextPrice / pos.entryPrice);
+          const net = Math.max(0, gross - guard.feeUsd);
+          cashDelta += net;
+          const isStop = guard.reason === 'stop' || guard.estimatedPnlUsd < 0;
+          chartMarker = {
+            label: isStop
+              ? `-${curSettings.stop_pct}% · -$${Math.abs(guard.estimatedPnlUsd).toFixed(2)}`
+              : `+$${guard.estimatedPnlUsd.toFixed(2)}`,
+            tone: isStop ? 'red' : 'green',
+          };
+          tickEventLabel = isStop
+            ? `Stop ${pos.symbol} -$${Math.abs(guard.estimatedPnlUsd).toFixed(2)}`
+            : `Exit ${pos.symbol} +$${guard.estimatedPnlUsd.toFixed(2)}`;
+          tickPositionId = pos.id;
+          newActivities.push({
+            id: `act-exit-${pos.id}-${now}`,
+            ts: now,
+            kind: isStop ? 'stopped' : 'sold',
+            mint: pos.mint,
+            symbol: pos.symbol,
+            name: pos.name,
+            bot: isStop ? 'risk' : 'executor',
+            title: isStop ? `Stopped ${pos.symbol}` : `Sold ${pos.symbol}`,
+            subtitle: `${isStop ? 'Risk' : 'Executor'} · ${guard.reason} · fee $${guard.feeUsd.toFixed(2)}`,
+            valueText: `${guard.estimatedPnlUsd >= 0 ? '+' : ''}$${guard.estimatedPnlUsd.toFixed(2)}`,
+            positive: guard.estimatedPnlUsd >= 0,
+            negative: guard.estimatedPnlUsd < 0,
+            link: guard.link,
+            audit: pos.audit,
+            token: updatedToken,
+            positionId: pos.id,
+          });
+          appendBotDecision(
+            'risk',
+            {
+              id: `rk-${pos.id}-${now}`,
+              ts: now,
+              mint: pos.mint,
+              symbol: pos.symbol,
+              verdict: guard.reason.toUpperCase(),
+              reason: `${guard.estimatedPnlUsd >= 0 ? '+' : ''}$${guard.estimatedPnlUsd.toFixed(2)}`,
+              link: guard.link,
+              positive: guard.estimatedPnlUsd >= 0,
+              negative: guard.estimatedPnlUsd < 0,
+            },
+            `${guard.reason}: ${pos.symbol}`,
+            `${guard.estimatedPnlUsd >= 0 ? '+' : ''}$${guard.estimatedPnlUsd.toFixed(2)}`
+          );
+          return {
+            ...pos,
+            currentPrice: nextPrice,
+            peakPrice: guard.newPeak,
+            remainingUsd: 0,
+            closedAt: now,
+            exitPrice: nextPrice,
+            exitReason: guard.reason,
+            pnlUsd: Math.round((pos.pnlUsd + guard.estimatedPnlUsd) * 100) / 100,
+            feesUsd: Math.round((pos.feesUsd + guard.feeUsd) * 100) / 100,
+            token: updatedToken,
+          };
+        }
+
+        return {
+          ...pos,
+          currentPrice: nextPrice,
+          peakPrice: guard.newPeak,
+          token: updatedToken,
+        };
+      });
+
+      positionsRef.current = nextPositions;
+      setPositions(nextPositions);
 
       if (cashDelta > 0) {
-        setFreeCash((c) => Math.round((c + cashDelta) * 100) / 100);
+        const updatedCash = Math.round((freeCashRef.current + cashDelta) * 100) / 100;
+        freeCashRef.current = updatedCash;
+        setFreeCash(updatedCash);
       }
 
       if (newActivities.length > 0) {
         setActivities((prev) => [...newActivities, ...prev].slice(0, 80));
       }
 
-      setLane((prev) => ({ ...prev, lastFrameTs: now }));
+      const openVal = nextPositions
+        .filter((p) => p.closedAt === null)
+        .reduce((s, p) => s + p.remainingUsd * (p.currentPrice / p.entryPrice), 0);
+      const eq = Math.round((freeCashRef.current + openVal) * 100) / 100;
 
-      setBalanceHistory((prev) => {
-        const openVal = positionsRef.current
-          .filter((p) => p.closedAt === null)
-          .reduce((s, p) => s + p.remainingUsd * (p.currentPrice / p.entryPrice), 0);
-        const eq = Math.round((freeCashRef.current + cashDelta + openVal) * 100) / 100;
-        return [
-          ...prev.slice(-80),
-          {
-            ts: now,
-            value: eq,
-            marker: chartMarker,
-          },
-        ];
+      setBalanceHistory((prev) => [
+        ...prev.slice(-119),
+        {
+          ts: now,
+          value: eq,
+          marker: chartMarker,
+        },
+      ]);
+
+      recordLivePnlTick(nextPositions, {
+        ts: now,
+        eventLabel: tickEventLabel,
+        positionId: tickPositionId,
       });
-    }, 2500);
+    };
 
-    // Periodically discover a new graduated token during active overnight simulation
-    const scanTimer = setInterval(() => {
-      const candidate = generateCandidateToken();
-      processTokenThroughPipeline(candidate);
-    }, 7500);
+    void pollRealPrices();
+    const priceTimer = setInterval(() => void pollRealPrices(), 3000);
+    const scanTimer = setInterval(() => void scanRealSource('auto'), 25000);
+    const statusTimer = setInterval(
+      () =>
+        void fetchLiveFeedStatus().then((st) => {
+          if (st) setLiveFeedStatus(st);
+        }),
+      15000
+    );
 
     return () => {
       clearInterval(priceTimer);
       clearInterval(scanTimer);
+      clearInterval(statusTimer);
     };
-  }, [engineRunning, appendBotDecision, processTokenThroughPipeline]);
+  }, [engineRunning, appendBotDecision, scanRealSource, recordLivePnlTick]);
 
   const handleUpdateSetting = useCallback(
     <K extends keyof DeskSettings>(
@@ -959,14 +1216,6 @@ export default function App() {
       },
     }));
   }, []);
-
-  const handleFetchDexScreener = useCallback(async (): Promise<number> => {
-    const tokens = await fetchLiveDexScreenerTokens();
-    for (const tok of tokens) {
-      processTokenThroughPipeline(tok);
-    }
-    return tokens.length;
-  }, [processTokenThroughPipeline]);
 
   const handleRunCommand = useCallback(
     (rawCmd: string) => {
@@ -1204,6 +1453,8 @@ export default function App() {
               freeCash={freeCash}
               startCash={settings.paper_start_cash}
               balanceHistory={balanceHistory}
+              livePnlTicks={livePnlTicks}
+              lastPriceSyncTs={lastPriceSyncTs}
               chartRange={chartRange}
               onChartRangeChange={setChartRange}
               lane={lane}
@@ -1213,14 +1464,18 @@ export default function App() {
               bots={bots}
               latestAudit={latestAudit}
               openPositions={openPositions}
+              allPositions={positions}
               tradesTonight={positions.length}
               passedTestsCount={testResults.filter((t) => t.status === 'pass').length}
               activities={activities}
               settings={settings}
               engineRunning={engineRunning}
+              scanningLive={scanningLive}
+              liveFeedStatus={liveFeedStatus}
+              lastSyncError={lastSyncError}
               onToggleEngine={() => setEngineRunning((r) => !r)}
-              onInjectTestCoin={() => processTokenThroughPipeline(generateCandidateToken())}
-              onRunCustomToken={(token) => processTokenThroughPipeline(token)}
+              onScanRealSource={scanRealSource}
+              onLookupRealToken={handleLookupRealToken}
               onUpdateSetting={handleUpdateSetting}
               onPauseAllSafe={() => {
                 setEngineRunning(false);
@@ -1243,11 +1498,9 @@ export default function App() {
             <BotsView
               bots={bots}
               hasOpenPosition={openPositions.length > 0}
+              liveFeedStatus={liveFeedStatus}
               onTogglePause={handleToggleBotPause}
-              onInjectTestCoin={(profile) =>
-                processTokenThroughPipeline(generateCandidateToken(profile))
-              }
-              onFetchDexScreener={handleFetchDexScreener}
+              onScanRealSource={scanRealSource}
               onJumpToSettings={() => setActiveTab('settings')}
             />
           )}
@@ -1292,6 +1545,14 @@ export default function App() {
               onRunAllTests={() => setTestResults(runAcceptanceSuite(settings, true))}
               consoleMessages={consoleMessages}
               onRunCommand={handleRunCommand}
+            />
+          )}
+
+          {activeTab === 'manual' && (
+            <ManualView
+              settings={settings}
+              onNavigate={setActiveTab}
+              onDownloadZip={() => downloadWindowsAppZip(settings)}
             />
           )}
         </main>

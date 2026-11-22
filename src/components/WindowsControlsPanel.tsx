@@ -2,23 +2,16 @@ import React, { useState } from 'react';
 import {
   CheckSquare,
   ChevronDown,
-  Play,
+  Globe,
   RotateCcw,
+  Search,
   ShieldCheck,
   Sliders,
   Square,
   Type,
 } from 'lucide-react';
-import { CandidateToken, DeskSettings } from '../types/desk';
-import { generateCandidateToken } from '../engine/marketFeed';
-
-export type TestTokenProfile =
-  | 'clean_high'
-  | 'clean_mid'
-  | 'scanner_kill_liq'
-  | 'analyst_fail_bundle'
-  | 'analyst_fail_dev'
-  | 'shill_ring';
+import { DeskSettings } from '../types/desk';
+import { LiveFeedSource } from '../engine/marketFeed';
 
 interface WindowsControlsPanelProps {
   settings: DeskSettings;
@@ -27,6 +20,7 @@ interface WindowsControlsPanelProps {
   tradesTonight: number;
   openPositionCount: number;
   passedTestsCount: number;
+  scanningLive: boolean;
   onToggleEngine: () => void;
   onTogglePrivate: () => void;
   onUpdateSetting: <K extends keyof DeskSettings>(
@@ -34,17 +28,17 @@ interface WindowsControlsPanelProps {
     value: DeskSettings[K],
     who?: 'me' | 'telegram'
   ) => void;
-  onRunCustomToken: (token: CandidateToken) => void;
+  onLookupRealToken: (query: string) => Promise<{ ok: boolean; message: string }>;
+  onScanRealSource: (source: LiveFeedSource) => Promise<{ count: number; error?: string }>;
   onPauseAllSafe: () => void;
 }
 
-const PROFILE_OPTIONS: Array<{ value: TestTokenProfile; label: string }> = [
-  { value: 'clean_high', label: '優良銘柄（8/8通過・高スコア）' },
-  { value: 'clean_mid', label: '中堅銘柄（スコア70〜79・半額サイズ）' },
-  { value: 'scanner_kill_liq', label: '低流動性銘柄（Scanner除外テスト）' },
-  { value: 'analyst_fail_bundle', label: 'バンドル不正銘柄（Layer 7 却下テスト）' },
-  { value: 'analyst_fail_dev', label: 'ラグ履歴Dev銘柄（Layer 3 却下テスト）' },
-  { value: 'shill_ring', label: 'シルリング検知銘柄（Brain半額テスト）' },
+const SOURCE_OPTIONS: Array<{ value: LiveFeedSource; label: string }> = [
+  { value: 'auto', label: '自動統合（PumpPortal卒業 + DexScreener最新）' },
+  { value: 'pumpportal', label: 'PumpPortal 卒業ストリーム優先' },
+  { value: 'boosts', label: 'DexScreener 最新ブースト銘柄 (Solana)' },
+  { value: 'profiles', label: 'DexScreener 最新登録プロフィール (Solana)' },
+  { value: 'pumpswap', label: 'PumpSwap ペア検索上位 (Solana)' },
 ];
 
 export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
@@ -54,17 +48,20 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
   tradesTonight,
   openPositionCount,
   passedTestsCount,
+  scanningLive,
   onToggleEngine,
   onTogglePrivate,
   onUpdateSetting,
-  onRunCustomToken,
+  onLookupRealToken,
+  onScanRealSource,
   onPauseAllSafe,
 }) => {
-  const [symbolInput, setSymbolInput] = useState('WINBOT');
-  const [memoInput, setMemoInput] = useState('24時間自由稼働テスト銘柄');
-  const [selectedProfile, setSelectedProfile] = useState<TestTokenProfile>('clean_high');
+  const [queryInput, setQueryInput] = useState('BONK');
+  const [memoInput, setMemoInput] = useState('実データ監査メモ');
+  const [selectedSource, setSelectedSource] = useState<LiveFeedSource>('auto');
+  const [busy, setBusy] = useState(false);
   const [statusLabel, setStatusLabel] = useState(
-    '待機中 — 各Windows UIコントロールから5ボットエンジンを直接操作できます。'
+    '実データ接続待機 — Solanaの実Mintアドレスまたはシンボルを入力し、DexScreener + RugCheck + Solana RPC で即時監査できます。'
   );
 
   const tradeQuotaPct = Math.min(
@@ -73,32 +70,41 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
   );
   const testPassPct = Math.round((passedTestsCount / 11) * 100);
 
-  const handleExecuteCustom = () => {
-    const cleanSym =
-      symbolInput
-        .trim()
-        .toUpperCase()
-        .replace(/[^A-Z0-9]/g, '')
-        .slice(0, 10) || 'WINBOT';
-    const base = generateCandidateToken(selectedProfile);
-    const customToken: CandidateToken = {
-      ...base,
-      symbol: cleanSym,
-      name: memoInput.trim() ? `${cleanSym} (${memoInput.trim().slice(0, 18)})` : cleanSym,
-    };
-    onRunCustomToken(customToken);
-    const profileLabel =
-      PROFILE_OPTIONS.find((p) => p.value === selectedProfile)?.label ?? selectedProfile;
+  const handleLookupAndRun = async () => {
+    const q = queryInput.trim();
+    if (!q) {
+      setStatusLabel('エラー: テキストボックスに Solana Mint アドレスまたは銘柄シンボルを入力してください。');
+      return;
+    }
+    setBusy(true);
+    setStatusLabel(`実データ照会中: "${q}" を DexScreener / RugCheck / Solana RPC で検証しています...`);
+    const res = await onLookupRealToken(q);
+    setBusy(false);
     setStatusLabel(
-      `実行完了: ${cleanSym} [${profileLabel}] を Scanner → Analyst → Brain → Executor へ投入しました。`
+      memoInput.trim() ? `${res.message}（メモ: ${memoInput.trim()}）` : res.message
     );
   };
 
+  const handleScanSource = async () => {
+    setBusy(true);
+    const label = SOURCE_OPTIONS.find((o) => o.value === selectedSource)?.label ?? selectedSource;
+    setStatusLabel(`実データスキャン中: ${label} から最新Solana銘柄を取得しています...`);
+    const res = await onScanRealSource(selectedSource);
+    setBusy(false);
+    if (res.error) {
+      setStatusLabel(`取得エラー: ${res.error}`);
+    } else if (res.count === 0) {
+      setStatusLabel('新規の未処理Solana銘柄は見つかりませんでした（既存監視対象のみ）。');
+    } else {
+      setStatusLabel(`実データ取得完了: ${res.count}件の実Solana銘柄を5ボットパイプラインへ投入しました。`);
+    }
+  };
+
   const handleClearInputs = () => {
-    setSymbolInput('WINBOT');
+    setQueryInput('');
     setMemoInput('');
-    setSelectedProfile('clean_high');
-    setStatusLabel('入力欄（テキストボックス・コンボボックス）を初期値にリセットしました。');
+    setSelectedSource('auto');
+    setStatusLabel('入力欄（テキストボックス・コンボボックス）をクリアしました。');
   };
 
   return (
@@ -106,14 +112,14 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
       aria-label="Windows 基本UIコントロールパネル"
       className="bg-[#1c1c1e] border border-[#545458]/50 rounded-2xl overflow-hidden"
     >
-      {/* Windows Panel Header */}
+      {/* Panel Header */}
       <div className="px-6 py-4 border-b border-[#545458]/40 flex flex-wrap items-center justify-between gap-4">
         <div>
           <h2 className="text-base font-semibold text-white">
-            Windows クイック操作パネル（基本UIコントロール）
+            Windows クイック操作パネル（実データ直結コントロール）
           </h2>
           <p className="text-xs text-[#ebebf5]/60 mt-0.5">
-            ラベル・テキストボックス・コンボボックス・チェックボックス・ラジオボタン・数値入力・プログレスバー・ボタンでデスクを直接操作します
+            ラベル・テキストボックス・コンボボックス・チェックボックス・ラジオボタン・数値入力・プログレスバー・ボタンで実Solanaデータを直接操作します
           </p>
         </div>
         <div className="text-xs font-mono-tabular text-[#ebebf5]/55">
@@ -123,13 +129,13 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
 
       {/* Control Grid */}
       <div className="p-6 grid grid-cols-1 lg:grid-cols-12 gap-5">
-        {/* 1. Label (Status Display) — full width top banner inside panel */}
+        {/* 1. Label */}
         <div className="lg:col-span-12 bg-[#141416] border border-[#545458]/40 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-start gap-3 min-w-0">
             <Type className="w-4 h-4 text-[#64d2ff] shrink-0 mt-0.5" />
             <div className="min-w-0">
               <div className="text-xs font-semibold text-white">
-                ラベル (Label) — ステータス・操作結果表示
+                ラベル (Label) — リアルタイムAPI応答・操作結果表示
               </div>
               <p className="text-xs text-[#ebebf5]/85 font-mono-tabular mt-1 break-words">
                 {statusLabel}
@@ -137,34 +143,32 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
             </div>
           </div>
           <span className="text-[11px] text-[#ebebf5]/50 shrink-0">
-            機能: 読み取り専用の現在状態や処理結果をユーザーへ通知します
+            機能: 読み取り専用の現在状態や実API照会結果を表示します
           </span>
         </div>
 
-        {/* 2. TextBox & ComboBox (Left 6 cols) */}
+        {/* 2. TextBox & ComboBox */}
         <div className="lg:col-span-6 bg-[#141416] border border-[#545458]/40 rounded-xl p-4 space-y-4">
-          {/* TextBox 1 */}
           <div>
             <div className="flex items-baseline justify-between gap-2 mb-1.5">
-              <label htmlFor="win-textbox-symbol" className="text-xs font-semibold text-white">
-                テキストボックス (TextBox) — 銘柄シンボル入力
+              <label htmlFor="win-textbox-query" className="text-xs font-semibold text-white">
+                テキストボックス (TextBox) — 実Solana銘柄シンボル / Mintアドレス指定
               </label>
-              <span className="text-[11px] text-[#ebebf5]/45">英数字 最大10文字</span>
+              <span className="text-[11px] text-[#ebebf5]/45">DexScreener + RugCheck直結</span>
             </div>
             <input
-              id="win-textbox-symbol"
+              id="win-textbox-query"
               type="text"
-              value={symbolInput}
-              onChange={(e) => setSymbolInput(e.target.value)}
-              placeholder="例: KURO, SHIBU, WINBOT"
+              value={queryInput}
+              onChange={(e) => setQueryInput(e.target.value)}
+              placeholder="例: WIF / POPCAT / DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
               className="w-full bg-[#1c1c1e] border border-[#545458]/60 rounded-lg px-3 py-2 text-xs font-mono-tabular text-white placeholder:text-[#ebebf5]/35 focus:outline-none focus:border-[#0a84ff]"
             />
             <p className="text-[11px] text-[#ebebf5]/55 mt-1">
-              機能: 任意のテキスト（銘柄名やテスト用ティッカー）をキーボードから入力します。
+              機能: 任意のSolana銘柄シンボルまたはMintアドレスを入力して実オンチェーン監査を実行します。
             </p>
           </div>
 
-          {/* TextBox 2 (Memo) */}
           <div>
             <label htmlFor="win-textbox-memo" className="block text-xs font-semibold text-white mb-1.5">
               テキストボックス (TextBox) — 監視メモ入力
@@ -179,24 +183,23 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
             />
           </div>
 
-          {/* ComboBox */}
           <div>
-            <label htmlFor="win-combobox-profile" className="block text-xs font-semibold text-white mb-1.5">
-              コンボボックス (ComboBox / Dropdown) — 銘柄プロファイル選択
+            <label htmlFor="win-combobox-source" className="block text-xs font-semibold text-white mb-1.5">
+              コンボボックス (ComboBox / Dropdown) — 実データ取得フィード選択
             </label>
             <div className="relative">
               <select
-                id="win-combobox-profile"
-                value={selectedProfile}
+                id="win-combobox-source"
+                value={selectedSource}
                 onChange={(e) => {
-                  const val = e.target.value as TestTokenProfile;
-                  setSelectedProfile(val);
-                  const found = PROFILE_OPTIONS.find((o) => o.value === val);
-                  setStatusLabel(`コンボボックス変更: 「${found?.label ?? val}」を選択しました。`);
+                  const val = e.target.value as LiveFeedSource;
+                  setSelectedSource(val);
+                  const found = SOURCE_OPTIONS.find((o) => o.value === val);
+                  setStatusLabel(`コンボボックス変更: 取得フィードを「${found?.label ?? val}」に切り替えました。`);
                 }}
                 className="w-full appearance-none bg-[#1c1c1e] border border-[#545458]/60 rounded-lg px-3 py-2 pr-9 text-xs text-white focus:outline-none focus:border-[#0a84ff] cursor-pointer"
               >
-                {PROFILE_OPTIONS.map((opt) => (
+                {SOURCE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.value} className="bg-[#1c1c1e] text-white">
                     {opt.label}
                   </option>
@@ -205,14 +208,13 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
               <ChevronDown className="w-4 h-4 text-[#ebebf5]/50 pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2" />
             </div>
             <p className="text-[11px] text-[#ebebf5]/55 mt-1">
-              機能: 定義済みの候補リストから1つの条件（優良・低流動性・バンドル不正など）を選択します。
+              機能: PumpPortal WebSocket や DexScreener API の取得対象ソースを選択します。
             </p>
           </div>
         </div>
 
-        {/* 3. CheckBox, RadioButton, NumericUpDown & ProgressBar (Right 6 cols) */}
+        {/* 3. CheckBox, RadioButton, NumberBox & ProgressBar */}
         <div className="lg:col-span-6 bg-[#141416] border border-[#545458]/40 rounded-xl p-4 space-y-4">
-          {/* CheckBoxes */}
           <div>
             <div className="flex items-center gap-1.5 text-xs font-semibold text-white mb-2">
               <CheckSquare className="w-3.5 h-3.5 text-[#00d35a]" />
@@ -222,16 +224,16 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
               <label className="flex items-center gap-2.5 text-xs text-[#ebebf5]/85 cursor-pointer select-none">
                 <input
                   type="checkbox"
-                  checked={settings.social_enabled}
+                  checked={settings.always_on_24h}
                   onChange={(e) => {
-                    onUpdateSetting('social_enabled', e.target.checked, 'me');
+                    onUpdateSetting('always_on_24h', e.target.checked, 'me');
                     setStatusLabel(
-                      `チェックボックス変更: Social (X検索) を ${e.target.checked ? '有効' : '無効'} にしました。`
+                      `チェックボックス変更: 24時間自由稼働を ${e.target.checked ? '有効' : '時間帯指定'} にしました。`
                     );
                   }}
-                  className="w-4 h-4 accent-[#0a84ff] rounded cursor-pointer"
+                  className="w-4 h-4 accent-[#00d35a] rounded cursor-pointer"
                 />
-                <span>Social (X公開検索・重み0.5) をスコア計算に含める</span>
+                <span>24時間自由稼働（時間制限・自動ロックなし）</span>
               </label>
 
               <label className="flex items-center gap-2.5 text-xs text-[#ebebf5]/85 cursor-pointer select-none">
@@ -241,7 +243,7 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
                   onChange={() => {
                     onTogglePrivate();
                     setStatusLabel(
-                      `チェックボックス変更: ブラウザ画面のプライバシー保護を ${!privatePaused ? '有効' : '解除'} にしました。`
+                      `チェックボックス変更: ライブブラウザ画面のプライバシー保護を ${!privatePaused ? '有効' : '解除'} にしました。`
                     );
                   }}
                   className="w-4 h-4 accent-[#ff9f0a] rounded cursor-pointer"
@@ -250,14 +252,13 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
               </label>
             </div>
             <p className="text-[11px] text-[#ebebf5]/55 mt-1.5">
-              機能: 複数の独立した設定項目をそれぞれチェックの有無でオン・オフ切替します。
+              機能: 複数の独立した稼働オプションをチェックの有無でオン・オフ切替します。
             </p>
           </div>
 
-          {/* RadioButtons */}
           <div className="pt-3 border-t border-[#545458]/30">
             <div className="text-xs font-semibold text-white mb-2">
-              ラジオボタン (RadioButton) — 監視実行モード切替
+              ラジオボタン (RadioButton) — 実データ監視モード切替
             </div>
             <div className="flex flex-wrap items-center gap-5">
               <label className="flex items-center gap-2 text-xs text-[#ebebf5]/85 cursor-pointer select-none">
@@ -267,11 +268,11 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
                   checked={!engineRunning}
                   onChange={() => {
                     if (engineRunning) onToggleEngine();
-                    setStatusLabel('ラジオボタン変更: 手動テスト待機モードに切り替えました。');
+                    setStatusLabel('ラジオボタン変更: 手動スキャン待機モードに切り替えました。');
                   }}
                   className="w-3.5 h-3.5 accent-[#0a84ff] cursor-pointer"
                 />
-                <span>手動テスト待機</span>
+                <span>手動スキャン待機</span>
               </label>
               <label className="flex items-center gap-2 text-xs text-[#ebebf5]/85 cursor-pointer select-none">
                 <input
@@ -280,19 +281,18 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
                   checked={engineRunning}
                   onChange={() => {
                     if (!engineRunning) onToggleEngine();
-                    setStatusLabel('ラジオボタン変更: 24時間自由稼働モードを開始しました。');
+                    setStatusLabel('ラジオボタン変更: 24時間実データ自動監視モードを開始しました。');
                   }}
                   className="w-3.5 h-3.5 accent-[#00d35a] cursor-pointer"
                 />
-                <span>24時間自動監視（時間制限なし · 自動スキャン & Risk常時稼働）</span>
+                <span>24時間自動監視（実価格5秒ポーリング & 自動スキャン）</span>
               </label>
             </div>
             <p className="text-[11px] text-[#ebebf5]/55 mt-1">
-              機能: 排他的な選択肢の中から必ず1つの動作モードを選択します。
+              機能: 排他的な選択肢の中から稼働方式を1つ選択します。
             </p>
           </div>
 
-          {/* NumericUpDown & ProgressBar */}
           <div className="pt-3 border-t border-[#545458]/30 grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
               <label
@@ -359,7 +359,7 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
         <div className="lg:col-span-12 pt-1 flex flex-wrap items-center justify-between gap-4 border-t border-[#545458]/35">
           <div className="text-xs text-[#ebebf5]/60">
             <span className="font-semibold text-white">ボタン (Button):</span>{' '}
-            クリックをトリガーに「5ボット実行」「入力初期化」「全ボット安全停止」の各アクションを発火します。
+            実データの照会・スキャン実行・入力クリア・安全停止の各処理を発火します。
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5 shrink-0">
@@ -369,7 +369,7 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
               className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white rounded-lg transition-colors whitespace-nowrap cursor-pointer"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              入力をリセット
+              入力クリア
             </button>
 
             <button
@@ -378,7 +378,7 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
                 onPauseAllSafe();
                 setStatusLabel(
                   openPositionCount > 0
-                    ? '安全停止: Scanner〜Executorを一時停止しました（Riskはポジション保有中のため継続稼働）。'
+                    ? '安全停止: Scanner〜Executorを一時停止しました（Riskは保有中のため継続稼働）。'
                     : '安全停止: 全ボットを一時停止しました。'
                 );
               }}
@@ -390,11 +390,22 @@ export const WindowsControlsPanel: React.FC<WindowsControlsPanelProps> = ({
 
             <button
               type="button"
-              onClick={handleExecuteCustom}
-              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-[#00d35a] hover:bg-[#1be06d] text-black rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+              disabled={busy || scanningLive}
+              onClick={handleScanSource}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-[#2c2c2e] hover:bg-[#3a3a3c] text-[#64d2ff] rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
             >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              入力内容でテスト銘柄を投入
+              <Globe className="w-3.5 h-3.5" />
+              {busy || scanningLive ? '実データ取得中...' : '選択フィードを実スキャン'}
+            </button>
+
+            <button
+              type="button"
+              disabled={busy || scanningLive}
+              onClick={handleLookupAndRun}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-[#00d35a] hover:bg-[#1be06d] text-black rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+            >
+              <Search className="w-3.5 h-3.5" />
+              指定銘柄を実データ監査
             </button>
           </div>
         </div>

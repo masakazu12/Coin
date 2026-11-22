@@ -1,14 +1,15 @@
 import React, { useState } from 'react';
-import { ExternalLink, Globe, Lock, Pause, Play, Plus, SlidersHorizontal } from 'lucide-react';
+import { ExternalLink, Globe, Lock, Pause, Play, Radio, SlidersHorizontal } from 'lucide-react';
 import { BotName, BotRuntimeStatus } from '../types/desk';
 import { BOT_META } from '../engine/defaults';
+import { LiveFeedSource, LiveFeedStatus } from '../engine/marketFeed';
 
 interface BotsViewProps {
   bots: Record<BotName, BotRuntimeStatus>;
   hasOpenPosition: boolean;
+  liveFeedStatus: LiveFeedStatus | null;
   onTogglePause: (bot: BotName) => void;
-  onInjectTestCoin: (profile?: 'clean_high' | 'clean_mid' | 'scanner_kill_liq' | 'analyst_fail_bundle' | 'analyst_fail_dev' | 'shill_ring') => void;
-  onFetchDexScreener: () => Promise<number>;
+  onScanRealSource: (source: LiveFeedSource) => Promise<{ count: number; error?: string }>;
   onJumpToSettings: () => void;
 }
 
@@ -17,61 +18,69 @@ const BOT_ORDER: BotName[] = ['scanner', 'analyst', 'brain', 'executor', 'risk']
 export const BotsView: React.FC<BotsViewProps> = ({
   bots,
   hasOpenPosition,
+  liveFeedStatus,
   onTogglePause,
-  onInjectTestCoin,
-  onFetchDexScreener,
+  onScanRealSource,
   onJumpToSettings,
 }) => {
-  const [fetchingLive, setFetchingLive] = useState(false);
+  const [fetchingSource, setFetchingSource] = useState<LiveFeedSource | null>(null);
   const [liveStatusMsg, setLiveStatusMsg] = useState<string | null>(null);
 
-  const handleFetchLive = async () => {
-    setFetchingLive(true);
+  const handleScan = async (source: LiveFeedSource, label: string) => {
+    setFetchingSource(source);
     setLiveStatusMsg(null);
-    const count = await onFetchDexScreener();
-    setFetchingLive(false);
-    setLiveStatusMsg(
-      count > 0
-        ? `DexScreenerからSolana実トークン ${count}件を取得し、Scannerパイプラインへ投入しました。`
-        : 'DexScreener APIへ到達できなかったため、ローカルPumpSwapジェネレータで代替実行できます。'
-    );
+    const res = await onScanRealSource(source);
+    setFetchingSource(null);
+    if (res.error) {
+      setLiveStatusMsg(`${label} 取得エラー: ${res.error}`);
+    } else if (res.count === 0) {
+      setLiveStatusMsg(`${label}: 新規の未処理Solana銘柄はありませんでした。`);
+    } else {
+      setLiveStatusMsg(
+        `${label} から実Solana銘柄 ${res.count}件を取得し、RugCheck + Solana RPC 監査を経て5ボットパイプラインへ投入しました。`
+      );
+    }
   };
 
   return (
     <div className="space-y-6">
-      {/* Action Bar */}
+      {/* Real Data Action Bar */}
       <div className="bg-[#1c1c1e] border border-[#545458]/50 rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h2 className="text-base font-semibold text-white">5ボット パイプライン管理</h2>
+          <h2 className="text-base font-semibold text-white">5ボット 実データパイプライン管理</h2>
           <p className="text-xs text-[#ebebf5]/60 mt-0.5">
-            Scanner → Analyst (8層 + Social) → Brain (計算) → Executor (押し目買い・利確) → Risk (常時監視)
+            PumpPortal WS ({liveFeedStatus?.pumpPortalConnected ? '接続済' : '再接続待機'} · 卒業検知 {liveFeedStatus?.recentMigrationsCount ?? 0}件) · RugCheck ラグDB ({liveFeedStatus?.ruggedMintsCount ?? 0}件) · DexScreener / Solana RPC 直結
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => onInjectTestCoin('clean_high')}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-[#00d35a] hover:bg-[#1be06d] text-black font-semibold rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            優良銘柄テスト投入
-          </button>
-          <button
-            type="button"
-            onClick={() => onInjectTestCoin('analyst_fail_bundle')}
-            className="px-3 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white rounded-lg transition-colors whitespace-nowrap cursor-pointer"
-          >
-            バンドル不正銘柄テスト
-          </button>
-          <button
-            type="button"
-            onClick={handleFetchLive}
-            disabled={fetchingLive}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-[#64d2ff] rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+            disabled={fetchingSource !== null}
+            onClick={() => void handleScan('auto', '総合ライブスキャン')}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-[#00d35a] hover:bg-[#1be06d] text-black rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
           >
             <Globe className="w-3.5 h-3.5" />
-            {fetchingLive ? 'DexScreener取得中...' : 'DexScreener実データ取得'}
+            {fetchingSource === 'auto' ? '実データ取得中...' : '最新Solana実銘柄スキャン'}
+          </button>
+
+          <button
+            type="button"
+            disabled={fetchingSource !== null}
+            onClick={() => void handleScan('pumpportal', 'PumpPortal卒業')}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-[#64d2ff] rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+          >
+            <Radio className="w-3.5 h-3.5" />
+            {fetchingSource === 'pumpportal' ? '取得中...' : 'PumpPortal卒業取得'}
+          </button>
+
+          <button
+            type="button"
+            disabled={fetchingSource !== null}
+            onClick={() => void handleScan('pumpswap', 'PumpSwap検索')}
+            className="px-3 py-2 text-xs font-medium bg-[#2c2c2e] hover:bg-[#3a3a3c] text-white rounded-lg transition-colors whitespace-nowrap cursor-pointer disabled:opacity-50"
+          >
+            {fetchingSource === 'pumpswap' ? '取得中...' : 'PumpSwap実ペア取得'}
           </button>
         </div>
       </div>
@@ -82,7 +91,7 @@ export const BotsView: React.FC<BotsViewProps> = ({
         </div>
       )}
 
-      {/* 5 Full-Width Bot Cards (STEP 10 Bots Tab) */}
+      {/* 5 Full-Width Bot Cards */}
       <div className="space-y-4">
         {BOT_ORDER.map((botKey) => {
           const bot = bots[botKey];
@@ -94,7 +103,6 @@ export const BotsView: React.FC<BotsViewProps> = ({
               key={botKey}
               className="bg-[#1c1c1e] border border-[#545458]/50 rounded-2xl overflow-hidden"
             >
-              {/* Card Header */}
               <div className="px-5 py-4 border-b border-[#545458]/35 flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-3 min-w-0">
                   <span
@@ -103,9 +111,7 @@ export const BotsView: React.FC<BotsViewProps> = ({
                   />
                   <div>
                     <div className="flex items-center gap-2.5">
-                      <h3 className="text-base font-semibold text-white">
-                        {meta.name}
-                      </h3>
+                      <h3 className="text-base font-semibold text-white">{meta.name}</h3>
                       <span className="text-xs text-[#ebebf5]/55">{meta.labelJa}</span>
                       <span className="text-xs font-mono-tabular text-[#ebebf5]/45">
                         · 本日 {bot.todayCount}件
@@ -158,10 +164,9 @@ export const BotsView: React.FC<BotsViewProps> = ({
                 </div>
               </div>
 
-              {/* Latest 20 Decisions Table */}
               <div className="px-5 py-3">
                 <div className="flex items-center justify-between text-xs text-[#ebebf5]/50 mb-2">
-                  <span>直近の判断ログ（最大20件）</span>
+                  <span>直近の判断ログ（最大20件 · 実データ）</span>
                   <span className="font-mono-tabular">
                     現在: {bot.headline} · {bot.subline}
                   </span>
@@ -169,7 +174,7 @@ export const BotsView: React.FC<BotsViewProps> = ({
 
                 {bot.decisions.length === 0 ? (
                   <div className="py-5 text-center text-xs text-[#ebebf5]/40">
-                    まだ判断履歴はありません
+                    まだ実データの判断履歴はありません
                   </div>
                 ) : (
                   <div className="max-h-[210px] overflow-y-auto divide-y divide-[#545458]/25">

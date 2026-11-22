@@ -242,6 +242,18 @@ export interface BalancePoint {
   };
 }
 
+export interface LivePnlTick {
+  ts: number;
+  netPnlUsd: number;
+  realizedPnlUsd: number;
+  unrealizedPnlUsd: number;
+  deltaUsd: number;
+  topSymbol: string;
+  topPriceUsd: number;
+  eventLabel?: string;
+  positionId?: string;
+}
+
 export interface BotRuntimeStatus {
   name: BotName;
   displayName: string;

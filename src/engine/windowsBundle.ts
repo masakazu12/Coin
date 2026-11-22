@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import { DeskSettings } from '../types/desk';
+import { buildManualMarkdown } from './manualContent';
 
 export interface WindowsBundleFile {
   path: string;
@@ -12,6 +13,12 @@ export function buildWindowsBundleFiles(settings: DeskSettings): WindowsBundleFi
   const settingsJson = JSON.stringify(settings, null, 2);
 
   return [
+    {
+      path: 'MANUAL_JP.md',
+      language: 'markdown',
+      description: 'Overnight Desk 日本語取扱説明書（全操作・5ボット仕様・コマンド・安全設計）',
+      content: buildManualMarkdown(settings),
+    },
     {
       path: 'README_WINDOWS.md',
       language: 'markdown',
@@ -403,12 +410,15 @@ class BrowserLane:
     {
       path: 'desk/main.py',
       language: 'python',
-      description: '単一asyncio常駐プロセス + FastAPIローカルダッシュボードサーバ',
-      content: `"""Overnight Desk — Single asyncio Process Entrypoint (Windows Desktop)."""
+      description: '単一asyncio常駐プロセス + PumpPortal WS + DexScreener/RugCheck実データ取得 + FastAPI',
+      content: `"""Overnight Desk — Single asyncio Process Entrypoint (Windows Desktop Live Data)."""
 from __future__ import annotations
 import asyncio
+import json
 import time
+import httpx
 import uvicorn
+import websockets
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from desk.db import init_db
@@ -416,6 +426,7 @@ from desk.config import DEFAULT_SETTINGS
 
 app = FastAPI(title="Overnight Desk Local Engine")
 conn = init_db()
+live_state = {"pump_ws": False, "last_mint": None, "scans_count": 0}
 
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -425,10 +436,12 @@ async def root():
 .card{background:#1c1c1e;border:1px solid rgba(84,84,88,.55);border-radius:14px;padding:24px;margin-top:16px}
 .mono{font-family:Consolas,monospace;color:#00d35a}</style></head>
 <body>
-<h1>Overnight Desk — Windows Local Engine Running</h1>
+<h1>Overnight Desk — Windows Local Live Engine</h1>
 <div class="card">
   <p>モード: <strong style="color:#ff9f0a">""" + str(DEFAULT_SETTINGS.get("mode", "PAPER")) + """</strong></p>
   <p>稼働スケジュール: <span class="mono">""" + ("24時間自由稼働 (制限なし)" if DEFAULT_SETTINGS.get("always_on_24h", True) else f"{DEFAULT_SETTINGS.get('night_start')} - {DEFAULT_SETTINGS.get('lock_time')}") + """</span></p>
+  <p>PumpPortal WS: <span class="mono">""" + ("Connected" if live_state["pump_ws"] else "Connecting...") + """</span></p>
+  <p>直近検知Mint: <span class="mono">""" + str(live_state["last_mint"] or "waiting...") + """</span></p>
   <p>SQLite WAL: <span class="mono">data/desk.db</span></p>
   <p>Chrome CDP Lane: <span class="mono">http://127.0.0.1:9222</span> (ローカル限定)</p>
   <p>FOMO Handle: <span class="mono">@""" + str(DEFAULT_SETTINGS.get("fomo_handle", "masakazu12")) + """</span></p>
@@ -442,7 +455,42 @@ async def health():
         "ts": int(time.time()),
         "mode": DEFAULT_SETTINGS.get("mode", "PAPER"),
         "always_on_24h": bool(DEFAULT_SETTINGS.get("always_on_24h", True)),
+        "pump_ws": live_state["pump_ws"],
+        "scans_count": live_state["scans_count"],
     }
+
+async def pumpportal_scanner_loop():
+    backoff = 1
+    while True:
+        try:
+            async with websockets.connect("wss://pumpportal.fun/api/data", ping_interval=30) as ws:
+                live_state["pump_ws"] = True
+                backoff = 1
+                await ws.send(json.dumps({"method": "subscribeMigration"}))
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    mint = msg.get("mint")
+                    if not mint:
+                        continue
+                    if msg.get("txType") == "migrate" or msg.get("pool"):
+                        live_state["last_mint"] = mint
+                        live_state["scans_count"] += 1
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            r = await client.get(f"https://api.dexscreener.com/tokens/v1/solana/{mint}")
+                            if r.status_code == 200:
+                                pairs = r.json() or []
+                                if pairs:
+                                    p = pairs[0]
+                                    conn.execute(
+                                        "INSERT OR REPLACE INTO coins (mint, name, symbol, pool, migrated_at) VALUES (?, ?, ?, ?, ?)",
+                                        (mint, p.get("baseToken", {}).get("name"), p.get("baseToken", {}).get("symbol"), p.get("pairAddress"), int(time.time())),
+                                    )
+                                    conn.commit()
+        except Exception:
+            live_state["pump_ws"] = False
+            await asyncio.sleep(backoff)
+            backoff = min(60, backoff * 2)
 
 async def heartbeat_loop():
     bots = ("scanner", "analyst", "brain", "executor", "risk")
@@ -459,7 +507,7 @@ async def heartbeat_loop():
 async def main():
     config = uvicorn.Config(app, host="127.0.0.1", port=8787, log_level="info")
     server = uvicorn.Server(config)
-    await asyncio.gather(server.serve(), heartbeat_loop())
+    await asyncio.gather(server.serve(), heartbeat_loop(), pumpportal_scanner_loop())
 
 if __name__ == "__main__":
     asyncio.run(main())

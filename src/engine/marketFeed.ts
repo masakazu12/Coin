@@ -1,121 +1,335 @@
 import { CandleBar, CandidateToken } from '../types/desk';
 
-const BASE58_CHARS = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+export type LiveFeedSource = 'auto' | 'pumpportal' | 'boosts' | 'profiles' | 'pumpswap';
 
-function makeSolanaAddress(seed: number, suffix = 'pump'): string {
-  let out = '';
-  let s = seed * 9301 + 49297;
-  for (let i = 0; i < 40; i++) {
-    s = (s * 16807) % 2147483647;
-    out += BASE58_CHARS[s % BASE58_CHARS.length];
-  }
-  return out + suffix;
+export interface LiveFeedStatus {
+  ok: boolean;
+  pumpPortalConnected: boolean;
+  pumpPortalLastEventTs: number;
+  recentMigrationsCount: number;
+  ruggedMintsCount: number;
+  lastRugSyncTs: number;
+  ts: number;
 }
 
-export function generateCandles(basePrice: number, count = 24, volatility = 0.06): CandleBar[] {
-  const now = Date.now();
-  const candles: CandleBar[] = [];
-  let price = basePrice * (0.78 + Math.random() * 0.25);
-
-  for (let i = count; i >= 1; i--) {
-    const ts = now - i * 60 * 1000;
-    const drift = (Math.random() - 0.47) * volatility;
-    const open = price;
-    const close = i === 1 ? basePrice : Math.max(0.000001, open * (1 + drift));
-    const high = Math.max(open, close) * (1 + Math.random() * volatility * 0.65);
-    const low = Math.min(open, close) * (1 - Math.random() * volatility * 0.55);
-    const volume = Math.round(1200 + Math.random() * 9800);
-    candles.push({ ts, open, high, low, close, volume });
-    price = close;
-  }
-  return candles;
+export interface LivePriceUpdate {
+  priceUsd: number;
+  liquidityUsd: number;
+  marketCapUsd: number;
+  volumeH1Usd: number;
+  volumeM5Usd: number;
+  h1ChangePct: number;
+  buys5m: number;
+  sells5m: number;
 }
 
-interface TokenTemplate {
+interface RawLiveCandidate {
+  mint: string;
   name: string;
   symbol: string;
-  profile: 'clean_high' | 'clean_mid' | 'scanner_kill_liq' | 'scanner_kill_top10' | 'analyst_fail_dev' | 'analyst_fail_bundle' | 'analyst_fail_score' | 'shill_ring';
+  dexId: string;
+  pool: string;
+  createdAt: number;
+  migratedAt: number;
+  curveMin: number;
+  creator: string;
+  priceUsd: number;
+  liquidityUsd: number;
+  marketCapUsd: number;
+  volumeH1Usd: number;
+  volumeM5Usd: number;
+  h1ChangePct: number;
+  h24ChangePct: number;
+  ageMin: number;
+  buys1h: number;
+  sells1h: number;
+  buys5m: number;
+  sells5m: number;
+  hasTwitter: boolean;
+  source: string;
 }
 
-const TEMPLATES: TokenTemplate[] = [
-  { name: 'KuroNeko', symbol: 'KURO', profile: 'clean_high' },
-  { name: 'Solana Shibuya', symbol: 'SHIBU', profile: 'clean_high' },
-  { name: 'VeloCat', symbol: 'VCAT', profile: 'clean_mid' },
-  { name: 'NeonDuck', symbol: 'NDUCK', profile: 'scanner_kill_liq' },
-  { name: 'TurboFrog', symbol: 'TFROG', profile: 'analyst_fail_bundle' },
-  { name: 'ZenithPup', symbol: 'ZPUP', profile: 'clean_high' },
-  { name: 'AetherFox', symbol: 'AFOX', profile: 'analyst_fail_dev' },
-  { name: 'MoonMochi', symbol: 'MOCHI', profile: 'clean_mid' },
-  { name: 'PumpSniper', symbol: 'PSNP', profile: 'scanner_kill_top10' },
-  { name: 'Kitsune AI', symbol: 'KITSU', profile: 'shill_ring' },
-  { name: 'RamenCoin', symbol: 'RAMEN', profile: 'clean_high' },
-  { name: 'ByteBear', symbol: 'BBEAR', profile: 'analyst_fail_score' },
-  { name: 'SoraCat', symbol: 'SORA', profile: 'clean_high' },
-  { name: 'PixelTanuki', symbol: 'TNKI', profile: 'clean_mid' },
-];
+interface RawLiveAudit {
+  mint: string;
+  sourcesUsed: string[];
+  mintRevoked: boolean;
+  freezeRevoked: boolean;
+  creator: string;
+  devHoldPct: number;
+  devRugHistoryCount: number;
+  top10Pct: number;
+  lpLockedPct: number;
+  bundledGroupSize: number;
+  insiderNetworksPct: number;
+  delegatedAccounts: number;
+  holders: number;
+  rugged: boolean;
+  warningText: string | null;
+  rugScore: number | null;
+}
 
-let templateCursor = 0;
-
-export function generateCandidateToken(forceProfile?: TokenTemplate['profile']): CandidateToken {
-  const tpl = forceProfile
-    ? TEMPLATES.find((t) => t.profile === forceProfile) ?? TEMPLATES[0]
-    : TEMPLATES[templateCursor++ % TEMPLATES.length];
-
-  const seed = Math.floor(Math.random() * 100000) + templateCursor * 17;
-  const mint = makeSolanaAddress(seed, 'pump');
-  const pool = makeSolanaAddress(seed + 777, 'swap');
-  const creator = makeSolanaAddress(seed + 333, 'dev1');
+function buildInitialRealCandles(priceUsd: number, h1ChangePct: number, volumeM5Usd: number): CandleBar[] {
   const now = Date.now();
-  const basePrice = Number((0.00018 + Math.random() * 0.0024).toFixed(6));
+  const prevPrice =
+    h1ChangePct > -95 ? priceUsd / (1 + h1ChangePct / 100) : priceUsd;
+  return [
+    {
+      ts: now - 60 * 1000,
+      open: prevPrice,
+      high: Math.max(prevPrice, priceUsd),
+      low: Math.min(prevPrice, priceUsd),
+      close: priceUsd,
+      volume: Math.round(volumeM5Usd),
+    },
+    {
+      ts: now,
+      open: priceUsd,
+      high: priceUsd,
+      low: priceUsd,
+      close: priceUsd,
+      volume: Math.round(volumeM5Usd),
+    },
+  ];
+}
 
+function combineCandidateAndAudit(raw: RawLiveCandidate, audit?: RawLiveAudit | null): CandidateToken {
+  const holders = audit?.holders && audit.holders > 0 ? audit.holders : Math.max(1, raw.buys1h);
+  return {
+    mint: raw.mint,
+    name: raw.name,
+    symbol: raw.symbol,
+    pool: raw.pool || raw.mint,
+    createdAt: raw.createdAt,
+    migratedAt: raw.migratedAt,
+    curveMin: raw.curveMin,
+    creator: audit?.creator || raw.creator || '',
+    creatorBalanceAtMigration: 100,
+    creatorBalanceNow: 100,
+    creatorSold: 0,
+    devHoldPct: audit ? audit.devHoldPct : 0,
+    devRugHistoryCount: audit ? audit.devRugHistoryCount : 0,
+    priceUsd: raw.priceUsd,
+    liquidityUsd: raw.liquidityUsd,
+    liquidityAtScanUsd: raw.liquidityUsd,
+    marketCapUsd: raw.marketCapUsd,
+    volumeH1Usd: raw.volumeH1Usd,
+    volumeM5Usd: raw.volumeM5Usd,
+    h1ChangePct: raw.h1ChangePct,
+    h24ChangePct: raw.h24ChangePct,
+    top10Pct: audit ? audit.top10Pct : 20,
+    lpLockedPct: audit ? audit.lpLockedPct : 0,
+    ageMin: raw.ageMin,
+    holders,
+    holders10mAgo: holders,
+    uniqueBuys1h: raw.buys1h,
+    uniqueSells1h: raw.sells1h,
+    uniqueBuys5m: raw.buys5m,
+    uniqueSells5m: raw.sells5m,
+    freshPct: 20,
+    bundledGroupSize: audit ? audit.bundledGroupSize : 0,
+    insiderNetworksPct: audit ? audit.insiderNetworksPct : 0,
+    delegatedAccounts: audit ? audit.delegatedAccounts : 0,
+    mintRevoked: audit ? audit.mintRevoked : false,
+    freezeRevoked: audit ? audit.freezeRevoked : false,
+    tokenWarnings: {
+      disableSelling: Boolean(audit?.rugged),
+      disableBuying: false,
+      warningText: audit?.warningText ?? null,
+    },
+    // Plan C per STEP 4 spec: never invent X counts without a real X API/webhook
+    social: {
+      u15: 0,
+      u60: 0,
+      accel: 0,
+      big: 0,
+      catalyst: null,
+      coinXAgeDays: raw.hasTwitter ? 7 : null,
+      coinXHasReplies: false,
+      smart: 0,
+      shill: 0,
+      plan: 'C',
+      enabled: false,
+    },
+    candles: buildInitialRealCandles(raw.priceUsd, raw.h1ChangePct, raw.volumeM5Usd),
+  };
+}
+
+/**
+ * Check real backend live data feed status (PumpPortal WS + RugCheck ticker)
+ */
+export async function fetchLiveFeedStatus(): Promise<LiveFeedStatus | null> {
+  try {
+    const res = await fetch('/api/live/status');
+    if (!res.ok) return null;
+    return (await res.json()) as LiveFeedStatus;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetch real live Solana token candidates from server (/api/live/candidates)
+ * and enrich passing/selected mints with real RugCheck + Solana RPC on-chain audits.
+ */
+export async function fetchRealSolanaCandidates(
+  source: LiveFeedSource = 'auto',
+  rpcUrl: string = 'https://api.mainnet-beta.solana.com',
+  limit: number = 4,
+  excludeMints: Set<string> = new Set()
+): Promise<{ tokens: CandidateToken[]; error?: string }> {
+  try {
+    const res = await fetch(`/api/live/candidates?source=${encodeURIComponent(source)}`);
+    if (!res.ok) {
+      return { tokens: [], error: `候補取得エラー (HTTP ${res.status})` };
+    }
+    const data = (await res.json()) as {
+      ok: boolean;
+      candidates?: RawLiveCandidate[];
+      error?: string;
+    };
+    if (!data.ok || !Array.isArray(data.candidates)) {
+      return { tokens: [], error: data.error || '実データの取得に失敗しました' };
+    }
+
+    const fresh = data.candidates
+      .filter((c) => c.mint && c.priceUsd > 0 && !excludeMints.has(c.mint))
+      .slice(0, limit);
+
+    // Run real RugCheck + Solana RPC audit in parallel for selected live tokens
+    const enriched = await Promise.all(
+      fresh.map(async (raw) => {
+        try {
+          const auditRes = await fetch(
+            `/api/live/audit/${encodeURIComponent(raw.mint)}?rpcUrl=${encodeURIComponent(rpcUrl)}`
+          );
+          if (!auditRes.ok) return combineCandidateAndAudit(raw, null);
+          const auditJson = (await auditRes.json()) as { ok: boolean; audit?: RawLiveAudit };
+          return combineCandidateAndAudit(raw, auditJson.audit ?? null);
+        } catch {
+          return combineCandidateAndAudit(raw, null);
+        }
+      })
+    );
+
+    return { tokens: enriched };
+  } catch (err) {
+    return {
+      tokens: [],
+      error: err instanceof Error ? err.message : 'ネットワークエラー',
+    };
+  }
+}
+
+/**
+ * Lookup ANY real Solana token by exact Mint address or Ticker Symbol via DexScreener + RugCheck + Solana RPC
+ */
+export async function lookupRealSolanaToken(
+  query: string,
+  rpcUrl: string = 'https://api.mainnet-beta.solana.com'
+): Promise<{ token: CandidateToken | null; error?: string }> {
+  try {
+    const res = await fetch(
+      `/api/live/token/${encodeURIComponent(query.trim())}?rpcUrl=${encodeURIComponent(rpcUrl)}`
+    );
+    const data = (await res.json()) as {
+      ok: boolean;
+      candidate?: RawLiveCandidate;
+      audit?: RawLiveAudit;
+      error?: string;
+    };
+    if (!res.ok || !data.ok || !data.candidate) {
+      return { token: null, error: data.error || `"${query}" に一致するSolana銘柄が見つかりません` };
+    }
+    return { token: combineCandidateAndAudit(data.candidate, data.audit ?? null) };
+  } catch (err) {
+    return {
+      token: null,
+      error: err instanceof Error ? err.message : '銘柄検索中にエラーが発生しました',
+    };
+  }
+}
+
+/**
+ * Poll real live prices for all open positions from DexScreener via /api/live/prices
+ */
+export async function fetchRealLivePrices(
+  mints: string[]
+): Promise<Record<string, LivePriceUpdate>> {
+  if (mints.length === 0) return {};
+  try {
+    const res = await fetch(`/api/live/prices?mints=${encodeURIComponent(mints.join(','))}`);
+    if (!res.ok) return {};
+    const data = (await res.json()) as {
+      ok: boolean;
+      prices?: Record<string, LivePriceUpdate>;
+    };
+    return data.ok && data.prices ? data.prices : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Deterministic unit-test fixture builder used strictly by STEP 15 acceptanceTests.ts
+ * (never used in live trading runtime).
+ */
+export function generateCandidateToken(
+  profile:
+    | 'clean_high'
+    | 'clean_mid'
+    | 'scanner_kill_liq'
+    | 'scanner_kill_top10'
+    | 'analyst_fail_dev'
+    | 'analyst_fail_bundle'
+    | 'analyst_fail_score'
+    | 'shill_ring' = 'clean_high'
+): CandidateToken {
+  const now = Date.now();
+  const basePrice = 0.001;
   const base: CandidateToken = {
-    mint,
-    name: tpl.name,
-    symbol: tpl.symbol,
-    pool,
+    mint: 'So11111111111111111111111111111111111111112',
+    name: 'FixtureToken',
+    symbol: 'FIXT',
+    pool: 'PoolFixture11111111111111111111111111111111',
     createdAt: now - 45 * 60 * 1000,
     migratedAt: now - 22 * 60 * 1000,
-    curveMin: 23,
-    creator,
-    creatorBalanceAtMigration: 1200000,
-    creatorBalanceNow: 1200000,
+    curveMin: 20,
+    creator: 'DevFixture111111111111111111111111111111111',
+    creatorBalanceAtMigration: 1000000,
+    creatorBalanceNow: 1000000,
     creatorSold: 0,
-    devHoldPct: 1.1,
+    devHoldPct: 1.0,
     devRugHistoryCount: 0,
     priceUsd: basePrice,
-    liquidityUsd: 48500,
-    liquidityAtScanUsd: 49000,
-    marketCapUsd: 265000,
-    volumeH1Usd: 44000,
-    volumeM5Usd: 5200,
-    h1ChangePct: 34,
-    h24ChangePct: 125,
-    top10Pct: 16.4,
+    liquidityUsd: 45000,
+    liquidityAtScanUsd: 45000,
+    marketCapUsd: 240000,
+    volumeH1Usd: 35000,
+    volumeM5Usd: 4200,
+    h1ChangePct: 30,
+    h24ChangePct: 110,
+    top10Pct: 16.0,
     lpLockedPct: 100,
-    ageMin: 24,
-    holders: 412,
-    holders10mAgo: 380,
-    uniqueBuys1h: 96,
-    uniqueSells1h: 54,
-    uniqueBuys5m: 18,
-    uniqueSells5m: 12,
-    freshPct: 24,
+    ageMin: 22,
+    holders: 380,
+    holders10mAgo: 360,
+    uniqueBuys1h: 90,
+    uniqueSells1h: 50,
+    uniqueBuys5m: 16,
+    uniqueSells5m: 10,
+    freshPct: 20,
     bundledGroupSize: 1,
     insiderNetworksPct: 4,
     delegatedAccounts: 0,
     mintRevoked: true,
     freezeRevoked: true,
-    tokenWarnings: {
-      disableSelling: false,
-      disableBuying: false,
-      warningText: null,
-    },
+    tokenWarnings: { disableSelling: false, disableBuying: false, warningText: null },
     social: {
-      u15: 19,
-      u60: 42,
-      accel: 1.81,
+      u15: 18,
+      u60: 40,
+      accel: 1.8,
       big: 2,
-      catalyst: 'Top Solana leaderboard traders accumulating after PumpSwap graduation',
+      catalyst: 'Unit test catalyst',
       coinXAgeDays: 14,
       coinXHasReplies: true,
       smart: 2,
@@ -123,185 +337,19 @@ export function generateCandidateToken(forceProfile?: TokenTemplate['profile']):
       plan: 'A',
       enabled: true,
     },
-    candles: generateCandles(basePrice),
+    candles: buildInitialRealCandles(basePrice, 30, 4200),
   };
 
-  switch (tpl.profile) {
-    case 'clean_high':
-      base.volumeH1Usd = 38000 + Math.round(Math.random() * 26000);
-      base.liquidityUsd = 36000 + Math.round(Math.random() * 44000);
-      base.liquidityAtScanUsd = base.liquidityUsd;
-      base.top10Pct = Number((12 + Math.random() * 8).toFixed(1));
-      base.devHoldPct = Number((0.4 + Math.random() * 2.1).toFixed(1));
-      base.ageMin = 14 + Math.floor(Math.random() * 35);
-      base.h1ChangePct = Math.round(14 + Math.random() * 46);
-      base.uniqueBuys1h = 78 + Math.floor(Math.random() * 45);
-      base.uniqueSells1h = Math.floor(base.uniqueBuys1h * 0.62);
-      break;
-    case 'clean_mid':
-      base.volumeH1Usd = 22000;
-      base.liquidityUsd = 28500;
-      base.liquidityAtScanUsd = 28500;
-      base.h1ChangePct = 78;
-      base.uniqueBuys1h = 62;
-      base.uniqueSells1h = 44;
-      base.uniqueBuys5m = 10;
-      base.uniqueSells5m = 13;
-      base.social.u15 = 8;
-      base.social.big = 1;
-      base.social.smart = 1;
-      base.social.catalyst = null;
-      break;
-    case 'scanner_kill_liq':
-      base.liquidityUsd = 14200;
-      base.liquidityAtScanUsd = 14200;
-      break;
-    case 'scanner_kill_top10':
-      base.top10Pct = 38.4;
-      break;
-    case 'analyst_fail_dev':
-      base.devHoldPct = 11.4;
-      base.devRugHistoryCount = 2;
-      break;
-    case 'analyst_fail_bundle':
-      base.bundledGroupSize = 14;
-      base.insiderNetworksPct = 38;
-      break;
-    case 'analyst_fail_score':
-      base.volumeH1Usd = 8200;
-      base.uniqueBuys1h = 24;
-      base.uniqueSells1h = 39;
-      base.uniqueBuys5m = 4;
-      base.uniqueSells5m = 12;
-      base.h1ChangePct = 175;
-      base.freshPct = 64;
-      base.curveMin = 4;
-      base.social.u15 = 3;
-      base.social.big = 0;
-      base.social.smart = 0;
-      base.social.catalyst = null;
-      break;
-    case 'shill_ring':
-      base.social.u15 = 26;
-      base.social.u60 = 40;
-      base.social.shill = 0.62;
-      base.social.smart = 1;
-      base.social.catalyst = null;
-      break;
+  if (profile === 'scanner_kill_liq') base.liquidityUsd = 14200;
+  if (profile === 'scanner_kill_top10') base.top10Pct = 38.4;
+  if (profile === 'analyst_fail_dev') {
+    base.devHoldPct = 11.4;
+    base.devRugHistoryCount = 2;
   }
-
+  if (profile === 'analyst_fail_bundle') {
+    base.bundledGroupSize = 14;
+    base.insiderNetworksPct = 38;
+  }
+  if (profile === 'shill_ring') base.social.shill = 0.62;
   return base;
-}
-
-/**
- * Fetch real live Solana trending / graduated token pairs from DexScreener public API
- * (no API key required). Maps into CandidateToken shape with safe defaults.
- */
-export async function fetchLiveDexScreenerTokens(): Promise<CandidateToken[]> {
-  try {
-    const res = await fetch('https://api.dexscreener.com/token-boosts/latest/v1');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const boosts = (await res.json()) as Array<{ chainId?: string; tokenAddress?: string }>;
-    const solMints = boosts
-      .filter((b) => b.chainId === 'solana' && b.tokenAddress)
-      .slice(0, 6)
-      .map((b) => b.tokenAddress as string);
-
-    if (solMints.length === 0) return [];
-
-    const pairRes = await fetch(
-      `https://api.dexscreener.com/tokens/v1/solana/${solMints.join(',')}`
-    );
-    if (!pairRes.ok) throw new Error(`HTTP ${pairRes.status}`);
-    const pairs = (await pairRes.json()) as Array<{
-      pairAddress?: string;
-      baseToken?: { address?: string; name?: string; symbol?: string };
-      priceUsd?: string;
-      liquidity?: { usd?: number };
-      fdv?: number;
-      marketCap?: number;
-      volume?: { h1?: number; m5?: number };
-      priceChange?: { h1?: number; h24?: number };
-      txns?: { h1?: { buys?: number; sells?: number }; m5?: { buys?: number; sells?: number } };
-      pairCreatedAt?: number;
-    }>;
-
-    const seen = new Set<string>();
-    const results: CandidateToken[] = [];
-
-    for (const p of pairs) {
-      const mint = p.baseToken?.address;
-      if (!mint || seen.has(mint)) continue;
-      seen.add(mint);
-
-      const price = Number(p.priceUsd || 0.001);
-      const liq = Number(p.liquidity?.usd || 0);
-      const mcap = Number(p.marketCap || p.fdv || liq * 4);
-      const ageMin = p.pairCreatedAt
-        ? Math.max(1, Math.round((Date.now() - p.pairCreatedAt) / 60000))
-        : 28;
-      const buys1h = p.txns?.h1?.buys ?? 72;
-      const sells1h = p.txns?.h1?.sells ?? 48;
-      const buys5m = p.txns?.m5?.buys ?? 14;
-      const sells5m = p.txns?.m5?.sells ?? 9;
-
-      results.push({
-        mint,
-        name: p.baseToken?.name || 'Solana Token',
-        symbol: p.baseToken?.symbol || 'SOLT',
-        pool: p.pairAddress || makeSolanaAddress(results.length + 10, 'swap'),
-        createdAt: p.pairCreatedAt || Date.now() - ageMin * 60000,
-        migratedAt: p.pairCreatedAt || Date.now() - ageMin * 60000,
-        curveMin: 18,
-        creator: makeSolanaAddress(results.length + 99, 'dev'),
-        creatorBalanceAtMigration: 800000,
-        creatorBalanceNow: 800000,
-        creatorSold: 0,
-        devHoldPct: 1.4,
-        devRugHistoryCount: 0,
-        priceUsd: price > 0 ? price : 0.001,
-        liquidityUsd: liq,
-        liquidityAtScanUsd: liq,
-        marketCapUsd: mcap,
-        volumeH1Usd: Number(p.volume?.h1 || 28000),
-        volumeM5Usd: Number(p.volume?.m5 || 3200),
-        h1ChangePct: Number(p.priceChange?.h1 || 18),
-        h24ChangePct: Number(p.priceChange?.h24 || 65),
-        top10Pct: 17.5,
-        lpLockedPct: 100,
-        ageMin,
-        holders: 320 + Math.floor(Math.random() * 400),
-        holders10mAgo: 305,
-        uniqueBuys1h: buys1h,
-        uniqueSells1h: sells1h,
-        uniqueBuys5m: buys5m,
-        uniqueSells5m: sells5m,
-        freshPct: 26,
-        bundledGroupSize: 1,
-        insiderNetworksPct: 5,
-        delegatedAccounts: 0,
-        mintRevoked: true,
-        freezeRevoked: true,
-        tokenWarnings: { disableSelling: false, disableBuying: false, warningText: null },
-        social: {
-          u15: 14,
-          u60: 32,
-          accel: 1.75,
-          big: 1,
-          catalyst: 'Live DexScreener Solana pool detected',
-          coinXAgeDays: 12,
-          coinXHasReplies: true,
-          smart: 1,
-          shill: 0.08,
-          plan: 'A',
-          enabled: true,
-        },
-        candles: generateCandles(price > 0 ? price : 0.001),
-      });
-    }
-
-    return results;
-  } catch {
-    return [];
-  }
 }
