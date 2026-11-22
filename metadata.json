@@ -1,0 +1,6 @@
+{
+  "name": "Overnight Desk — Windows Trading Bot Console",
+  "description": "5-bot Solana PumpSwap overnight trading desk for Windows featuring Scanner, 8-layer Analyst, Brain sizing, 1-click Browser Lane Executor, Risk guard, and Windows desktop package exporter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
